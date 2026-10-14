@@ -3,8 +3,9 @@ import * as db from './db.js';
 import * as api from './api.js';
 import { portfolio, isStale, todayISO, txType, avgConversionRate } from './calc.js';
 import { parseIbkr, planImport } from './ibkr.js';
+import { xlsxRows, rowsToCsv } from './xlsx.js';
 
-const VERSION = '1.2.1';
+const VERSION = '1.2.2';
 const DEFAULT_SETTINGS = { finnhubKey: '', twelveKey: '', ccy: 'ILS', hide: false, rateMode: 'official' };
 const MIN_REFRESH_MS = 60e3;
 
@@ -110,8 +111,8 @@ function FilePick({ accept, onFile, children, cls = 'btn' }) {
   return html`<button type="button" class=${cls} onClick=${() => ref.current.click()}>${children}</button>
     <input type="file" accept=${accept} ref=${ref} hidden onChange=${(e) => { const f = e.target.files[0]; e.target.value = ''; if (f) onFile(f); }}/>`;
 }
-const ACCEPT_BACKUP = 'application/json,.json,text/plain,.txt,.csv,text/csv,text/comma-separated-values';
-const ACCEPT_CSV = '.csv,text/csv,text/comma-separated-values,application/vnd.ms-excel,text/plain,.txt,.json,application/json';
+const ACCEPT_BACKUP = 'application/json,.json,text/plain,.txt,.csv,text/csv,text/comma-separated-values,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const ACCEPT_CSV = '.csv,text/csv,text/comma-separated-values,application/vnd.ms-excel,text/plain,.txt,.json,application/json,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
 // ---------- screens ----------
 function Welcome({ state, onImport, onIbkr }) {
@@ -513,7 +514,7 @@ function Settings({ state, saveSettings, onExport, onImport, onIbkr, onRefresh, 
       <ol class="small muted steps-list">
         <li>In IBKR (Client Portal / website): <b>Performance & Reports → Statements → Activity</b>.</li>
         <li>Period: <b>Custom</b>, from your first trade to today. Format: <b>CSV</b>. Run → Download.</li>
-        <li>Pick that file below. Re-import any time — already imported trades are skipped.</li>
+        <li>Pick that file below (CSV, or the same file opened/saved in Excel or Google Sheets). Re-import any time — already imported trades are skipped.</li>
       </ol>
       <${FilePick} accept=${ACCEPT_CSV} onFile=${onIbkr}>Choose IBKR CSV file<//>
       <p class="small muted">Reads stock buys and sells, USD.ILS conversions, dividends and US tax withheld.</p>
@@ -731,7 +732,12 @@ function App() {
   // Any file button accepts either kind of file: a backup (JSON) or an IBKR statement (CSV).
   async function importAny(file) {
     let text;
-    try { text = await file.text(); } catch (e) { return toast('Couldn’t read the file: ' + e.message, 'error', 9000); }
+    try {
+      const buf = await file.arrayBuffer();
+      const sig = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
+      if (sig[0] === 0x50 && sig[1] === 0x4b) text = rowsToCsv(await xlsxRows(buf)); // "PK": an Excel/Google Sheets file
+      else text = new TextDecoder().decode(buf);
+    } catch (e) { return toast('Couldn’t read the file: ' + e.message, 'error', 9000); }
     const head = text.replace(/^[\uFEFF\u200B\s]+/, '');
     if (head.startsWith('{')) return importBackup(head);
     return pickIbkr(head, file.name);

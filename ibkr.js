@@ -29,9 +29,18 @@ const num = (s) => {
   const v = Number(String(s).replace(/,/g, '').trim());
   return s === '' ? NaN : v;
 };
+// Spreadsheet date serial (days since 1899-12-30) -> Date, used when a CSV went through Excel/Google Sheets.
+const serialToDate = (n) => new Date(Math.round((n - 25569) * 86400) * 1000);
+const isSerial = (s) => /^\d{5}(\.\d+)?$/.test(String(s).trim()) && +s > 20000 && +s < 80000;
 export function isoDate(s) {
+  if (isSerial(s)) return serialToDate(+s).toISOString().slice(0, 10);
   const m = String(s || '').match(/(\d{4})-?(\d{2})-?(\d{2})/);
   return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
+}
+function timeOf(s) {
+  if (isSerial(s)) return serialToDate(+s).toISOString().slice(11, 19);
+  const m = String(s || '').match(/(\d{1,2}):(\d{2}):(\d{2})/);
+  return m ? `${m[1].padStart(2, '0')}:${m[2]}:${m[3]}` : '';
 }
 function hash(str) {
   let h = 0x811c9dc5;
@@ -44,7 +53,8 @@ function tradeToTxn({ assetClass, currency, symbol, dateRaw, qty, price, comm },
   const date = isoDate(dateRaw);
   if (!date || !isFinite(qty) || !isFinite(price)) { skipped.push(`Unreadable trade row: ${symbol} ${dateRaw}`); return; }
   const fees = Math.abs(isFinite(comm) ? comm : 0);
-  const key = `${symbol}|${dateRaw}|${qty}|${price}`;
+  // ID from normalised values, so the same trade gets the same ID whether it came from a CSV or a spreadsheet copy
+  const key = `${symbol.toUpperCase()}|${date}T${timeOf(dateRaw)}|${qty}|${price}`;
   if (/^(stocks?|stk|etf)$/i.test(assetClass)) {
     if (currency && currency !== 'USD') { skipped.push(`${symbol}: ${currency} trades not supported`); return; }
     const base = { ticker: symbol.toUpperCase(), date, shares: Math.abs(qty), priceUsd: price, feesUsd: fees, source: 'ibkr' };
