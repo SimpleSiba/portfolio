@@ -159,7 +159,14 @@ export function portfolio(txns, quotes, fxNow, today = todayISO()) {
   total.totalPlIls = total.plIls == null ? null : total.plIls + agg.realizedIls + agg.divIls;
   total.totalRetUsd = total.totalPlUsd == null ? null : ret(agg.investedAllUsd, agg.investedAllUsd + total.totalPlUsd);
   total.totalRetIls = total.totalPlIls == null ? null : ret(agg.investedAllIls, agg.investedAllIls + total.totalPlIls);
-  for (const h of holdings) h.weight = total.valueIls > 0 && h.valueIls ? h.valueIls / total.valueIls : 0;
+  for (const h of holdings) {
+    h.weight = total.valueIls > 0 && h.valueIls ? h.valueIls / total.valueIls : 0;
+    const a = annualised([...h.buys, ...h.sells, ...h.divs], h.valueUsd, h.valueIls, today);
+    h.annUsd = a.usd; h.annIls = a.ils; h.annShort = a.short;
+  }
+  const allStock = txns.filter((t) => txType(t) !== 'fx');
+  const a = annualised(allStock, total.missing ? null : total.valueUsd, total.missing ? null : total.valueIls, today);
+  total.annUsd = a.usd; total.annIls = a.ils; total.annShort = a.short;
   return { holdings, total };
 }
 
@@ -179,4 +186,79 @@ export function isStale(fetchedAt, now = Date.now()) {
   if (!fetchedAt) return true;
   const age = now - fetchedAt;
   return usMarketOpen(new Date(now)) ? age > 15 * 60e3 : age > 4 * 24 * 3600e3;
+}
+
+// ---------- exact shekel cost of buys from your own conversions (first in, first out) ----------
+// Every conversion adds dollars to a pool at its rate; dividends and sale proceeds add dollars at the
+// official rate of their date. Each buy spends the oldest dollars first. Dollars converted on the same
+// day as a buy count as available to it (IBKR's automatic conversions settle the buy they belong to).
+// If the pool runs dry, the missing part uses the official rate of the buy date.
+export function fifoBuyRates(txns, official) {
+  const ev = [];
+  for (const t of txns) {
+    const ty = txType(t);
+    const k = ty === 'fx' || ty === 'div' ? 0 : ty === 'buy' ? 1 : 2;
+    ev.push({ t, ty, k, key: `${t.date}|${k}|${t.time || ''}` });
+  }
+  ev.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  const pool = [];
+  const rates = new Map();
+  const take = (usd) => { // remove usd from the pool, return ILS cost of what was taken and the shortfall
+    let ils = 0;
+    while (usd > EPS && pool.length) {
+      const p = pool[0];
+      const n = Math.min(usd, p.usd);
+      ils += n * p.rate; p.usd -= n; usd -= n;
+      if (p.usd <= EPS) pool.shift();
+    }
+    return { ils, short: Math.max(0, usd) };
+  };
+  for (const { t, ty } of ev) {
+    if (ty === 'fx') { if (t.usd > 0) pool.push({ usd: t.usd, rate: t.ils / t.usd }); else take(-t.usd); }
+    else if (ty === 'div') { const n = t.grossUsd - (t.taxUsd || 0); if (n > 0) pool.push({ usd: n, rate: t.fx > 0 ? t.fx : official(t.date) }); }
+    else if (ty === 'sell') { const n = t.shares * t.priceUsd - (t.feesUsd || 0); if (n > 0) pool.push({ usd: n, rate: t.fx > 0 ? t.fx : official(t.date) }); }
+    else {
+      const cost = t.shares * t.priceUsd + (t.feesUsd || 0);
+      const { ils, short } = take(cost);
+      const off = short > EPS ? official(t.date) : 0;
+      rates.set(t.id, { rate: (ils + short * (off || 0)) / cost, fromPool: cost - short, short, ok: !(short > EPS && !off) });
+    }
+  }
+  return rates;
+}
+
+// ---------- annualised (money-weighted) return ----------
+// flows: [{date, amount}] — money in is negative, money out (and today's value) positive.
+export function xirr(flows) {
+  if (flows.length < 2 || !flows.some((f) => f.amount > 0) || !flows.some((f) => f.amount < 0)) return null;
+  const t0 = Date.parse(flows[0].date);
+  const ys = flows.map((f) => (Date.parse(f.date) - t0) / (365.25 * 864e5));
+  const npv = (r) => flows.reduce((a, f, i) => a + f.amount / Math.pow(1 + r, ys[i]), 0);
+  let lo = -0.9999, hi = 100, flo = npv(lo), fhi = npv(hi);
+  if (!isFinite(flo) || !isFinite(fhi) || flo * fhi > 0) return null;
+  for (let i = 0; i < 200; i++) {
+    const mid = (lo + hi) / 2, fm = npv(mid);
+    if (Math.abs(fm) < 1e-9) return mid;
+    if (flo * fm < 0) { hi = mid; fhi = fm; } else { lo = mid; flo = fm; }
+  }
+  return (lo + hi) / 2;
+}
+
+// Annualised return for a set of transactions plus today's value, in USD and ILS.
+// Returns null figures when the money has been invested for less than a year (annualising would exaggerate).
+export function annualised(txns, valueUsd, valueIls, today = todayISO()) {
+  const fu = [], fi = [];
+  for (const t of txns) {
+    const ty = txType(t);
+    if (ty === 'buy') { const c = t.shares * t.priceUsd + (t.feesUsd || 0); fu.push({ date: t.date, amount: -c }); fi.push({ date: t.date, amount: -c * t.fxAtBuy }); }
+    else if (ty === 'sell') { const n = t.shares * t.priceUsd - (t.feesUsd || 0); fu.push({ date: t.date, amount: n }); fi.push({ date: t.date, amount: n * t.fx }); }
+    else if (ty === 'div') { const n = t.grossUsd - (t.taxUsd || 0); fu.push({ date: t.date, amount: n }); fi.push({ date: t.date, amount: n * t.fx }); }
+  }
+  if (!fu.length) return { usd: null, ils: null, short: false };
+  fu.sort((a, b) => a.date.localeCompare(b.date)); fi.sort((a, b) => a.date.localeCompare(b.date));
+  const days = (Date.parse(today) - Date.parse(fu[0].date)) / 864e5;
+  if (days < 365) return { usd: null, ils: null, short: true };
+  if (valueUsd != null) fu.push({ date: today, amount: valueUsd });
+  if (valueIls != null) fi.push({ date: today, amount: valueIls });
+  return { usd: valueUsd == null ? null : xirr(fu), ils: valueIls == null ? null : xirr(fi), short: false };
 }

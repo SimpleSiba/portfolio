@@ -47,6 +47,18 @@ function hash(str) {
   for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
   return h.toString(36);
 }
+const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+// "January 1, 2026 - October 13, 2026" -> "2026-10-13" (also handles a single date)
+export function periodEnd(s) {
+  const parts = String(s || '').split(' - ');
+  const last = parts[parts.length - 1].trim();
+  const iso = isoDate(last);
+  if (iso && /\d{4}-\d{2}-\d{2}/.test(last)) return iso;
+  const m = last.match(/([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})/);
+  if (!m) return null;
+  const mo = MONTHS.indexOf(m[1].toLowerCase());
+  return mo < 0 ? null : `${m[3]}-${String(mo + 1).padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+}
 const tickerFromDesc = (d) => (String(d).match(/^\s*([A-Z0-9.\-]+)\s*\(/) || [])[1] || null;
 
 function tradeToTxn({ assetClass, currency, symbol, dateRaw, qty, price, comm }, out, skipped) {
@@ -57,13 +69,13 @@ function tradeToTxn({ assetClass, currency, symbol, dateRaw, qty, price, comm },
   const key = `${symbol.toUpperCase()}|${date}T${timeOf(dateRaw)}|${qty}|${price}`;
   if (/^(stocks?|stk|etf)$/i.test(assetClass)) {
     if (currency && currency !== 'USD') { skipped.push(`${symbol}: ${currency} trades not supported`); return; }
-    const base = { ticker: symbol.toUpperCase(), date, shares: Math.abs(qty), priceUsd: price, feesUsd: fees, source: 'ibkr' };
+    const base = { ticker: symbol.toUpperCase(), date, time: timeOf(dateRaw), shares: Math.abs(qty), priceUsd: price, feesUsd: fees, source: 'ibkr' };
     if (qty > 0) out.push({ id: 'ib-' + hash('buy|' + key), type: 'buy', ...base });
     else if (qty < 0) out.push({ id: 'ib-' + hash('sell|' + key), type: 'sell', ...base });
   } else if (/^(forex|cash)$/i.test(assetClass)) {
     if (symbol.toUpperCase() !== 'USD.ILS') { skipped.push(`Currency pair ${symbol} not supported`); return; }
     // Quantity = USD bought (negative = USD sold back), price = ILS per USD
-    out.push({ id: 'ib-' + hash('fx|' + key), type: 'fx', date, usd: qty, ils: qty * price, source: 'ibkr' });
+    out.push({ id: 'ib-' + hash('fx|' + key), type: 'fx', date, time: timeOf(dateRaw), usd: qty, ils: qty * price, source: 'ibkr' });
   } else skipped.push(`${assetClass} ${symbol} not supported`);
 }
 
@@ -71,12 +83,19 @@ function parseActivity(rows) {
   const headers = {};
   const out = [], skipped = [];
   const divs = new Map(); // ticker|date -> {gross, tax}
+  let asOf = null, periodFrom = null;
+  const positions = {};
   for (const r of rows) {
     const [section, kind] = r;
+    if (section === 'Statement' && kind === 'Data' && r[2] === 'Period') { asOf = periodEnd(r[3]); periodFrom = periodEnd(String(r[3]).split(' - ')[0]); }
     if (kind === 'Header') { headers[section] = r.slice(2); continue; }
     if (kind !== 'Data' || !headers[section]) continue;
     const h = headers[section];
     const v = (name) => { const i = h.indexOf(name); return i < 0 ? undefined : r[i + 2]; };
+    if (section === 'Open Positions') {
+      if (v('DataDiscriminator') === 'Summary' && /^stocks?$/i.test(v('Asset Category') || '')) positions[(v('Symbol') || '').toUpperCase()] = num(v('Quantity'));
+      continue;
+    }
     if (section === 'Trades') {
       const disc = v('DataDiscriminator');
       if (disc && !/^(Order|Trade|Execution)$/i.test(disc)) continue; // skip ClosedLot etc.
@@ -103,7 +122,7 @@ function parseActivity(rows) {
     out.push({ id: 'ib-' + hash(`div|${d.ticker}|${d.date}|${d.gross.toFixed(4)}`), type: 'div', ticker: d.ticker, date: d.date,
       grossUsd: +d.gross.toFixed(4), taxUsd: +d.tax.toFixed(4), source: 'ibkr' });
   }
-  return { txns: out, skipped, format: 'Activity Statement' };
+  return { txns: out, skipped, format: 'Activity Statement', period: asOf && periodFrom ? { from: periodFrom, to: asOf } : null, positions: asOf ? { asOf, shares: positions } : null };
 }
 
 function parseFlex(rows) {
@@ -117,7 +136,7 @@ function parseFlex(rows) {
     tradeToTxn({ assetClass: c.ac != null ? r[c.ac] : 'STK', currency: c.cur != null ? r[c.cur] : 'USD', symbol: r[c.sym] || '',
       dateRaw: r[c.date], qty: num(r[c.qty]), price: num(r[c.price]), comm: c.comm != null ? num(r[c.comm]) : 0 }, out, skipped);
   }
-  return { txns: out, skipped, format: 'Flex Query' };
+  return { txns: out, skipped, format: 'Flex Query', positions: null };
 }
 
 export function parseIbkr(text) {
@@ -135,25 +154,69 @@ export function parseIbkr(text) {
 
 // Decide what an import changes. Manual buys (not from IBKR) that match an imported day's buys
 // for the same ticker and total shares are replaced by the exact IBKR versions.
-export function planImport(existing, parsed) {
+export function planImport(existing, parsed, period = null) {
+  // The period the file covers (from the statement header, else the span of its transactions)
+  const dates = parsed.map((t) => t.date).sort();
+  const span = period || (dates.length ? { from: dates[0], to: dates[dates.length - 1] } : null);
   const have = new Set(existing.map((t) => t.id));
   const fresh = parsed.filter((t) => !have.has(t.id));
   const duplicates = parsed.length - fresh.length;
+  const isManual = (t) => !String(t.id).startsWith('ib-');
   const manual = new Map();
   for (const t of existing) {
-    if ((t.type || 'buy') !== 'buy' || String(t.id).startsWith('ib-')) continue;
+    if ((t.type || 'buy') !== 'buy' || !isManual(t)) continue;
     const k = `${t.ticker}|${t.date}`;
-    const m = manual.get(k) || { ids: [], shares: 0 };
+    const m = manual.get(k) || { ids: [], shares: 0, date: t.date, ticker: t.ticker };
     m.ids.push(t.id); m.shares += t.shares; manual.set(k, m);
   }
   const imported = new Map();
-  for (const t of fresh) if (t.type === 'buy') { const k = `${t.ticker}|${t.date}`; imported.set(k, (imported.get(k) || 0) + t.shares); }
-  const removeIds = [];
-  for (const [k, shares] of imported) {
-    const m = manual.get(k);
-    if (m && Math.abs(m.shares - shares) < 1e-6) removeIds.push(...m.ids);
+  for (const t of fresh) if (t.type === 'buy') {
+    const k = `${t.ticker}|${t.date}`;
+    const g = imported.get(k) || { shares: 0, date: t.date, ticker: t.ticker };
+    g.shares += t.shares; imported.set(k, g);
   }
+  const removeIds = [];
+  const matched = new Set();
+  for (const [k, g] of imported) {
+    const m = manual.get(k);
+    if (m && Math.abs(m.shares - g.shares) < 1e-6) { removeIds.push(...m.ids); matched.add(k); }
+  }
+  // Same stock and shares, dates up to 3 days apart (e.g. settlement date vs trade date): ask the user.
+  const near = [];
+  const DAY = 864e5;
+  for (const [mk, m] of manual) {
+    if (removeIds.includes(m.ids[0])) continue;
+    for (const [ik, g] of imported) {
+      if (matched.has(ik) || g.ticker !== m.ticker || Math.abs(g.shares - m.shares) > 1e-6) continue;
+      const gap = Math.abs(Date.parse(g.date) - Date.parse(m.date)) / DAY;
+      if (gap > 0 && gap <= 3) { near.push({ ids: m.ids, ticker: m.ticker, shares: m.shares, manualDate: m.date, ibkrDate: g.date }); matched.add(ik); break; }
+    }
+  }
+  // "IBKR is the master" only removes hand entries inside the file's period — later or earlier ones stay
+  const manualIds = existing.filter((t) => isManual(t) && (t.type || 'buy') !== 'fx' && !removeIds.includes(t.id)
+    && span && t.date >= span.from && t.date <= span.to).map((t) => t.id);
   const counts = { buy: 0, sell: 0, div: 0, fx: 0 };
   for (const t of fresh) counts[t.type]++;
-  return { add: fresh, removeIds, duplicates, counts };
+  return { add: fresh, removeIds, near, manualIds, duplicates, counts, span };
+}
+
+// Shares per stock in `txns` on `asOf`, compared with IBKR's own position list from the same statement.
+export function checkPositions(txns, positions) {
+  if (!positions) return null;
+  const app = {};
+  for (const t of txns) {
+    const ty = t.type || 'buy';
+    if ((ty !== 'buy' && ty !== 'sell') || t.date > positions.asOf) continue;
+    app[t.ticker] = (app[t.ticker] || 0) + (ty === 'buy' ? t.shares : -t.shares);
+  }
+  const diffs = [];
+  const tickers = new Set([...Object.keys(app), ...Object.keys(positions.shares)]);
+  let count = 0;
+  for (const tk of tickers) {
+    const a = +(app[tk] || 0).toFixed(6), b = +(positions.shares[tk] || 0).toFixed(6);
+    if (a === 0 && b === 0) continue;
+    count++;
+    if (Math.abs(a - b) > 1e-6) diffs.push({ ticker: tk, app: a, ibkr: b });
+  }
+  return { asOf: positions.asOf, ok: diffs.length === 0, diffs, count };
 }

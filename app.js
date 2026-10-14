@@ -1,12 +1,12 @@
 import { html, render, useState, useEffect, useMemo, useRef } from './preact-htm.mjs';
 import * as db from './db.js';
 import * as api from './api.js';
-import { portfolio, isStale, todayISO, txType, avgConversionRate } from './calc.js';
-import { parseIbkr, planImport } from './ibkr.js';
+import { portfolio, isStale, todayISO, txType, fifoBuyRates } from './calc.js';
+import { parseIbkr, planImport, checkPositions } from './ibkr.js';
 import { xlsxRows, rowsToCsv } from './xlsx.js';
 
-const VERSION = '1.2.2';
-const DEFAULT_SETTINGS = { finnhubKey: '', twelveKey: '', ccy: 'ILS', hide: false, rateMode: 'official' };
+const VERSION = '1.3.0';
+const DEFAULT_SETTINGS = { finnhubKey: '', twelveKey: '', ccy: 'ILS', hide: false, rateMode: 'official', lockId: null };
 const MIN_REFRESH_MS = 60e3;
 
 // ---------- formatting ----------
@@ -138,7 +138,7 @@ function Welcome({ state, onImport, onIbkr }) {
   </section>`;
 }
 
-function Home({ pf, ccy, setCcy, state, onExport, onImport, onIbkr }) {
+function Home({ pf, ccy, setCcy, state, onExport, onImport, onIbkr, onUndo }) {
   if (!state.lots.length) return html`<${Welcome} state=${state} onImport=${onImport} onIbkr=${onIbkr}/>`;
   const { total, holdings } = pf;
   const open = holdings.filter((h) => !h.closed);
@@ -161,6 +161,9 @@ function Home({ pf, ccy, setCcy, state, onExport, onImport, onIbkr }) {
         <span class=${'num ' + tone(total['totalPl' + C])}>${fmtSigned(total['totalPl' + C], ccy)} (${fmtPct(total['totalRet' + C])})</span>
         <span class="muted"> all time</span>
       </div>
+      <div class="sub small">${total['ann' + C] != null
+        ? html`<span class=${tone(total['ann' + C])}>${fmtPct(total['ann' + C], 1)}</span><span class="muted"> per year (money-weighted)</span>`
+        : total.annShort ? html`<span class="muted">Per-year return shows after one year of investing</span>` : ''}</div>
       ${extra && html`<div class="sub small muted breakdown">
         <span>Open <span class=${tone(total['pl' + C])}>${fmtSigned(total['pl' + C], ccy)}</span></span>
         ${Math.abs(total['realized' + C]) > 1e-9 && html`<span>Realised <span class=${tone(total['realized' + C])}>${fmtSigned(total['realized' + C], ccy)}</span></span>`}
@@ -184,6 +187,8 @@ function Home({ pf, ccy, setCcy, state, onExport, onImport, onIbkr }) {
     </div>`}
     ${gainers.length > 0 && html`<h2>Top gainers</h2><div class="card list">${gainers.map(Row)}</div>`}
     ${losers.length > 0 && html`<h2>Top losers</h2><div class="card list">${losers.map(Row)}</div>`}
+    ${state.undo && Date.now() - state.undo.at < 864e5 && html`<div class="banner">
+      <span>Imported ${state.undo.label}.</span><button class="btn small" onClick=${onUndo}>Undo</button></div>`}
     ${needBackup && html`<div class="banner">
       <span>${state.meta.lastExport ? 'Last backup over 30 days ago.' : 'No backup yet.'} Your data lives only on this phone.</span>
       <button class="btn small" onClick=${() => onExport('download')}>Back up</button>
@@ -192,7 +197,7 @@ function Home({ pf, ccy, setCcy, state, onExport, onImport, onIbkr }) {
 }
 
 const SORTS = { value: 'Value', pl: 'P/L', ret: 'Return', day: 'Today' };
-function Holdings({ pf, ccy, sort, setSort }) {
+function Holdings({ pf, ccy, sort, setSort, check }) {
   if (!pf.holdings.length) return html`<section><div class="card placeholder"><p>No investments yet.</p><button class="btn primary" onClick=${() => go('#tx/new/buy')}>Add your first buy</button></div></section>`;
   const C = ccy === 'ILS' ? 'Ils' : 'Usd';
   const key = { value: (h) => h['value' + C] ?? -Infinity, pl: (h) => h['totalPl' + C] ?? -Infinity, ret: (h) => h['totalRet' + C] ?? -Infinity, day: (h) => h.dayPct ?? -Infinity }[sort];
@@ -200,6 +205,11 @@ function Holdings({ pf, ccy, sort, setSort }) {
   const closed = pf.holdings.filter((h) => h.closed).sort((a, b) => (b['totalPl' + C] ?? 0) - (a['totalPl' + C] ?? 0));
   const n = pf.holdings.reduce((a, h) => a + h.buys.length + h.sells.length + h.divs.length, 0);
   return html`<section>
+    ${check && html`<div class=${'card check-result ' + (check.ok ? 'good' : 'bad')}>
+      ${check.ok ? html`<b>✓ All ${check.count} positions match IBKR</b> <span class="small muted">on ${fmtDate(check.asOf)} (last import)</span>`
+        : html`<b>${plural(check.diffs.length, 'position differs', 'positions differ')} from IBKR on ${fmtDate(check.asOf)}</b>
+          <ul class="small">${check.diffs.map((d) => html`<li>${d.ticker}: app ${fmtShares(d.app)} · IBKR ${fmtShares(d.ibkr)}</li>`)}</ul>`}
+    </div>`}
     <div class="chips" role="group" aria-label="Sort by">
       ${Object.entries(SORTS).map(([k, t]) => html`<button class=${'chip ' + (sort === k ? 'on' : '')} aria-pressed=${sort === k} onClick=${() => setSort(k)}>${t}</button>`)}
     </div>
@@ -242,7 +252,8 @@ function Detail({ ticker, pf, ccy, quotes }) {
   ];
   if (h.sells.length) stats.push(['Realised', S(h['realized' + C])]);
   if (h.divs.length) stats.push(['Dividends (net)', S(h['div' + C])]);
-  stats.push(['Total P/L', S(h['totalPl' + C])], ['Total return', html`<span class=${tone(h['totalRet' + C])}>${fmtPct(h['totalRet' + C])}</span>`]);
+  stats.push(['Total P/L', S(h['totalPl' + C])], ['Total return', html`<span class=${tone(h['totalRet' + C])}>${fmtPct(h['totalRet' + C])}</span>`],
+    ['Per year', h['ann' + C] != null ? html`<span class=${tone(h['ann' + C])}>${fmtPct(h['ann' + C], 1)}</span>` : html`<span class="muted small">${h.annShort ? 'after 1 year' : '—'}</span>`]);
   if (!h.closed) stats.push(['Weight', fmtPct(h.weight, 1).replace('+', '')], ['Today', S(h['day' + C])]);
   if (ccy === 'ILS' && !h.closed) stats.push(['Stock effect', S(h.stockEffectIls)], ['Currency effect', S(h.fxEffectIls)]);
   const openBy = new Map(h.lots.map((m) => [m.lot.id, m]));
@@ -302,9 +313,9 @@ function TxForm({ route, txns, pf, settings, onSave, onDelete }) {
     ? { ticker: existing.ticker || '', date: existing.date, shares: S(existing.shares), priceUsd: S(existing.priceUsd), feesUsd: S(existing.feesUsd || 0),
         rate: S(existing.fxAtBuy ?? existing.fx), grossUsd: S(existing.grossUsd), taxUsd: S(existing.taxUsd), ils: S(existing.ils), usd: S(existing.usd), note: existing.note || '' }
     : { ticker: route.form.ticker || '', date: todayISO(), shares: '', priceUsd: '', feesUsd: '0', rate: '', grossUsd: '', taxUsd: '', ils: '', usd: '', note: '' });
-  const convAvailable = (d) => avgConversionRate(txns.filter((t) => t.id !== existing?.id), d) != null;
+  const hasConv = txns.some((t) => txType(t) === 'fx');
   // Existing entries keep their stored rate unless the user picks a source again.
-  const [mode, setMode] = useState(() => (existing ? existing.fxMode || 'manual' : settings.rateMode === 'conv' ? 'conv' : 'official'));
+  const [mode, setMode] = useState(() => (existing ? existing.fxMode || 'manual' : settings.rateMode === 'fifo' && hasConv ? 'fifo' : 'official'));
   const [official, setOfficial] = useState(null);
   const [busy, setBusy] = useState(false);
   const [check, setCheck] = useState(null);
@@ -318,14 +329,14 @@ function TxForm({ route, txns, pf, settings, onSave, onDelete }) {
     if (!f.date || type === 'fx') return;
     let live = true;
     setBusy(true);
-    api.fxUsdIls(f.date >= todayISO() ? 'latest' : f.date)
+    api.officialRate(f.date >= todayISO() ? 'latest' : f.date)
       .then((r) => live && setOfficial(r.rate)).catch(() => live && setOfficial(null)).finally(() => live && setBusy(false));
     return () => { live = false; };
   }, [f.date, type]);
 
-  const conv = avgConversionRate(txns.filter((t) => t.id !== existing?.id), f.date);
-  const autoRate = type === 'buy' && mode === 'conv' ? conv : official;
-  useEffect(() => { if (mode !== 'manual' && autoRate) setF((o) => ({ ...o, rate: String(+autoRate.toFixed(6)) })); }, [autoRate, mode]);
+  // "My conversions" buys get their exact rate when saved (it depends on all your other transactions);
+  // until then the official rate is shown so the form is complete.
+  useEffect(() => { if (mode !== 'manual' && official && !(existing && mode === existing.fxMode)) setF((o) => ({ ...o, rate: String(+official.toFixed(6)) })); }, [official, mode]);
   useEffect(() => { if (type === 'div' && !taxEdited && num(f.grossUsd) > 0) setF((o) => ({ ...o, taxUsd: String(+(num(o.grossUsd) * 0.25).toFixed(2)) })); }, [f.grossUsd, type]);
 
   async function checkTicker() {
@@ -375,9 +386,9 @@ function TxForm({ route, txns, pf, settings, onSave, onDelete }) {
     : type === 'sell' ? num(f.shares) * num(f.priceUsd) - (num(f.feesUsd) || 0)
     : type === 'div' ? num(f.grossUsd) - (num(f.taxUsd) || 0) : num(f.usd);
   const rateLabel = { buy: 'USD/ILS at buy', sell: 'USD/ILS on sale date', div: 'USD/ILS on pay date' }[type];
-  const rateHint = mode === 'manual' ? 'Your rate'
-    : busy && !(type === 'buy' && mode === 'conv') ? 'Fetching rate…'
-    : type === 'buy' && mode === 'conv' ? (conv ? 'Your average conversion rate up to this date' : 'No conversions logged before this date')
+  const rateHint = mode === 'manual' ? 'Your rate — never changed automatically'
+    : type === 'buy' && mode === 'fifo' ? 'Worked out from your conversions when you save (oldest dollars first)'
+    : busy ? 'Fetching rate…'
     : official ? 'Official rate for that date' : 'Couldn’t fetch — type the rate';
 
   return html`<form class="form" onSubmit=${save} novalidate>
@@ -405,14 +416,14 @@ function TxForm({ route, txns, pf, settings, onSave, onDelete }) {
           <span class="hint muted">${taxEdited ? 'Your amount' : '25% filled in — edit to your statement'}</span></label>
       </div>`}
     ${type === 'fx' && html`
-      <p class="small muted">Log each time you converted shekels to dollars (e.g. in IBKR). Your buys can then use your real average rate.</p>
+      <p class="small muted">Log each time you converted shekels to dollars. With “Cost rate: My conversions”, each buy is costed from the dollars it actually used.</p>
       <div class="two">
         <label>Shekels paid (ILS) <${Err} k="ils"/><input inputmode="decimal" value=${f.ils} onInput=${set('ils')} placeholder="10000"/></label>
         <label>Dollars received (USD) <${Err} k="usd"/><input inputmode="decimal" value=${f.usd} onInput=${set('usd')} placeholder="3270"/></label>
       </div>`}
     ${type !== 'fx' && html`<label>${rateLabel} <${Err} k="rate"/>
       ${type === 'buy' && html`<${Segmented} label="Rate source" value=${mode} onChange=${setMode}
-        options=${[['official', 'Official'], ['conv', 'My conversions', !convAvailable(f.date)], ['manual', 'Custom']]}/>`}
+        options=${[['official', 'Official'], ['fifo', 'My conversions', !hasConv], ['manual', 'Custom']]}/>`}
       <input inputmode="decimal" value=${f.rate} onInput=${(e) => { setMode('manual'); set('rate')(e); }} placeholder=${busy ? 'loading…' : '3.0573'}/>
       <span class="hint muted">${rateHint}</span></label>`}
     <label>Note<input value=${f.note} onInput=${set('note')} placeholder="optional"/></label>
@@ -428,11 +439,19 @@ function TxForm({ route, txns, pf, settings, onSave, onDelete }) {
   </form>`;
 }
 
-function ImportPreview({ pending, onConfirm, onCancel }) {
+function ImportPreview({ pending, resultOf, onConfirm, onCancel }) {
+  const [nearOn, setNearOn] = useState(() => new Set((pending?.plan.near || []).map((n, i) => i)));
+  const [master, setMaster] = useState(false);
   if (!pending) return html`<section><p class="muted">Nothing to import. Pick a file in Settings.</p></section>`;
-  const { plan, skipped, format, fileName } = pending;
+  const { plan, skipped, format, fileName, positions } = pending;
   const c = plan.counts;
   const total = plan.add.length;
+  const nearIds = plan.near.filter((n, i) => nearOn.has(i)).flatMap((n) => n.ids);
+  const opts = { nearIds, master };
+  const { remove, list } = resultOf(pending, opts);
+  const check = checkPositions(list, positions);
+  const extraManual = plan.manualIds.filter((id) => !remove.has(id) || master).length;
+  const toggle = (i) => setNearOn((s) => { const n = new Set(s); n.has(i) ? n.delete(i) : n.add(i); return n; });
   return html`<section>
     <div class="card">
       <p class="small muted">${fileName} · ${format}</p>
@@ -440,24 +459,37 @@ function ImportPreview({ pending, onConfirm, onCancel }) {
         <ul class="plain">
           ${c.buy > 0 && html`<li>${plural(c.buy, 'buy', 'buys')}</li>`}
           ${c.sell > 0 && html`<li>${plural(c.sell, 'sell', 'sells')}</li>`}
-          ${c.div > 0 && html`<li>${plural(c.div, 'dividend', 'dividends')} (with US tax withheld)</li>`}
+          ${c.div > 0 && html`<li>${plural(c.div, 'dividend', 'dividends')}</li>`}
           ${c.fx > 0 && html`<li>${plural(c.fx, 'currency conversion', 'currency conversions')} (USD.ILS)</li>`}
         </ul>
-        ${plan.removeIds.length > 0 && html`<p class="small">${plan.removeIds.length} buys you entered by hand match IBKR trades (same stock, day and shares) and will be <b>replaced</b> by the exact IBKR versions.</p>`}
+        ${plan.removeIds.length > 0 && html`<p class="small">${plural(plan.removeIds.length, 'buy', 'buys')} you entered by hand match IBKR trades (same stock, day and shares) and will be <b>replaced</b> by the exact IBKR versions.</p>`}
         ${plan.duplicates > 0 && html`<p class="small muted">${plan.duplicates} already imported earlier — skipped.</p>`}`}
       ${skipped.length > 0 && html`<details class="small"><summary>${plural(skipped.length, 'row', 'rows')} not imported</summary><ul>${skipped.map((s) => html`<li>${s}</li>`)}</ul></details>`}
-      <p class="small muted">Exchange rates: buys use your “Cost rate” setting; sells and dividends use the official rate of their date.</p>
     </div>
-    <button class="btn wide primary" disabled=${total === 0 && plan.removeIds.length === 0} onClick=${onConfirm}>Import ${plural(total, 'transaction', 'transactions')}</button>
+    ${plan.near.length > 0 && html`<h2>Possible duplicates</h2><div class="card form">
+      <p class="small muted">Same stock and number of shares, but the dates differ by 1–3 days (often trade date vs settlement date). Ticked = replace yours with IBKR’s.</p>
+      ${plan.near.map((n, i) => html`<label class="check"><input type="checkbox" checked=${nearOn.has(i)} onChange=${() => toggle(i)}/>
+        <span>${n.ticker} · ${fmtNum(n.shares)} shares — yours ${fmtDate(n.manualDate)}, IBKR ${fmtDate(n.ibkrDate)}</span></label>`)}
+    </div>`}
+    ${plan.manualIds.length > 0 && html`<div class="card form"><label class="check"><input type="checkbox" checked=${master} onChange=${(e) => setMaster(e.target.checked)}/>
+      <span>IBKR is the master: also remove ${plural(plan.manualIds.length, 'other entry', 'other entries')} you added by hand between ${fmtDate(pending.period?.from || plan.span?.from || '')} and ${fmtDate(pending.period?.to || plan.span?.to || '')}</span></label></div>`}
+    ${check && html`<div class=${'card check-result ' + (check.ok ? 'good' : 'bad')}>
+      ${check.ok ? html`<b>✓ All ${check.count} positions will match IBKR</b> <span class="small muted">on ${fmtDate(check.asOf)}</span>`
+        : html`<b>After this import, ${plural(check.diffs.length, 'position differs', 'positions differ')} from IBKR on ${fmtDate(check.asOf)}:</b>
+          <ul class="small">${check.diffs.map((d) => html`<li>${d.ticker}: app ${fmtNum(d.app)} · IBKR ${fmtNum(d.ibkr)}</li>`)}</ul>
+          <p class="small muted">Usually a missing earlier file (import older statements too) or a hand-entered duplicate.</p>`}
+    </div>`}
+    <p class="small muted">Buys get their shekel cost from your “Cost rate” setting; sells and dividends use the official rate of their date. You can undo this import in Settings.</p>
+    <button class="btn wide primary" disabled=${total === 0 && remove.size === 0} onClick=${() => onConfirm(opts)}>Import ${plural(total, 'transaction', 'transactions')}</button>
     <button class="btn wide ghost" onClick=${onCancel}>Cancel</button>
   </section>`;
 }
 
 function Conversions({ txns }) {
   const list = txns.filter((t) => txType(t) === 'fx').sort((a, b) => b.date.localeCompare(a.date));
-  const avg = avgConversionRate(txns);
+  const usd = list.reduce((a, t) => a + t.usd, 0), ils = list.reduce((a, t) => a + t.ils, 0);
   return html`<section>
-    <div class="card row-between"><span>Average rate</span><b class="num">${avg ? '₪' + avg.toFixed(4) + ' per $' : '—'}</b></div>
+    <div class="card row-between"><span>${plural(list.length, 'conversion', 'conversions')} · net ${fmtMoney(usd, 'USD')}</span><b class="num">${usd > 0 ? '₪' + (ils / usd).toFixed(4) + ' per $ overall' : '—'}</b></div>
     <div class="card list">
       ${list.length === 0 && html`<p class="muted small" style="padding:14px 16px">No conversions yet.</p>`}
       ${list.map((t) => html`<button class="hrow" onClick=${() => go('#tx/' + encodeURIComponent(t.id))}>
@@ -471,7 +503,7 @@ function Conversions({ txns }) {
   </section>`;
 }
 
-function Settings({ state, saveSettings, onExport, onImport, onIbkr, onRefresh, onDeleteAll, onRecalc, toast }) {
+function Settings({ state, saveSettings, onExport, onImport, onIbkr, onRefresh, onDeleteAll, onRecalc, onUndo, onLock, toast }) {
   const s = state.settings;
   const [keys, setKeys] = useState({ finnhubKey: s.finnhubKey, twelveKey: s.twelveKey });
   const [show, setShow] = useState(false);
@@ -479,7 +511,7 @@ function Settings({ state, saveSettings, onExport, onImport, onIbkr, onRefresh, 
   const [confirmDel, setConfirmDel] = useState(false);
   const dirty = keys.finnhubKey !== s.finnhubKey || keys.twelveKey !== s.twelveKey;
   const nConv = state.lots.filter((t) => txType(t) === 'fx').length;
-  const avg = avgConversionRate(state.lots);
+  const SOURCE = { boi: 'Bank of Israel representative rate', ecb: 'European Central Bank rate (Bank of Israel unreachable)' };
 
   async function runTest() {
     setTest({ busy: true });
@@ -488,7 +520,7 @@ function Settings({ state, saveSettings, onExport, onImport, onIbkr, onRefresh, 
     await Promise.all([
       keys.finnhubKey ? t('Finnhub', async () => `SPY ${price((await api.finnhubQuote('SPY', keys.finnhubKey.trim())).price)}`) : (res.Finnhub = { ok: false, text: 'No key' }),
       keys.twelveKey ? t('Twelve Data', async () => `SPY ${price((await api.twelveQuote('SPY', keys.twelveKey.trim())).price)}`) : (res['Twelve Data'] = { ok: false, text: 'No key' }),
-      t('Frankfurter', async () => { const r = await api.fxUsdIls(); return `USD/ILS ${r.rate} (${r.date})`; }),
+      t('Exchange rate', async () => { const r = await api.officialRate('latest'); return `USD/ILS ${r.rate} (${fmtDate(r.date)}, ${r.source === 'boi' ? 'Bank of Israel' : 'ECB via Frankfurter'})`; }),
     ]);
     setTest(res);
   }
@@ -522,15 +554,16 @@ function Settings({ state, saveSettings, onExport, onImport, onIbkr, onRefresh, 
 
     <h2>Currency conversions</h2>
     <div class="card form">
-      <div class="row-between"><span>${nConv} conversions${avg ? html` · avg <b>₪${avg.toFixed(4)}</b> per $` : ''}</span>
+      <div class="row-between"><span>${plural(nConv, 'conversion', 'conversions')}</span>
         <button class="btn small" type="button" onClick=${() => go('#conversions')}>View / add</button></div>
       <div class="row-between"><span>Cost rate for buys</span>
-        <${Segmented} label="Cost rate for buys" value=${s.rateMode} onChange=${(v) => saveSettings({ rateMode: v })}
-          options=${[['official', 'Official'], ['conv', 'My conversions', !nConv]]}/></div>
-      <p class="small muted">${s.rateMode === 'conv'
-        ? 'Each buy uses your average conversion rate up to its date (official rate if you had no conversion yet).'
+        <${Segmented} label="Cost rate for buys" value=${s.rateMode} onChange=${async (v) => { await saveSettings({ rateMode: v }); onRecalc(); }}
+          options=${[['official', 'Official'], ['fifo', 'My conversions', !nConv]]}/></div>
+      <p class="small muted">${s.rateMode === 'fifo'
+        ? 'Each buy is costed from the dollars it actually used: your conversions, oldest dollars first (dollars converted the same day count). If you had no converted dollars left, the official rate is used.'
         : 'Each buy uses the official USD/ILS rate of its date.'} Buys where you typed a custom rate are never changed.</p>
-      <button class="btn" type="button" onClick=${onRecalc}>Apply to all existing buys</button>
+      <p class="small muted">Official rate source: ${SOURCE[state.fx?.source] || 'not fetched yet'}.</p>
+      <button class="btn" type="button" onClick=${onRecalc}>Recalculate all buys</button>
     </div>
 
     <h2>Display</h2>
@@ -539,6 +572,13 @@ function Settings({ state, saveSettings, onExport, onImport, onIbkr, onRefresh, 
         <${Segmented} label="Main currency" value=${s.ccy} onChange=${(v) => saveSettings({ ccy: v })} options=${[['ILS', '₪ ILS'], ['USD', '$ USD']]}/></div>
       <div class="row-between"><span>Hide amounts <span class="small muted">(eye button at the top)</span></span>
         <${Segmented} label="Hide amounts" value=${s.hide ? 'on' : 'off'} onChange=${(v) => saveSettings({ hide: v === 'on' })} options=${[['off', 'Show'], ['on', 'Hide']]}/></div>
+    </div>
+
+    <h2>Security</h2>
+    <div class="card form">
+      <div class="row-between"><span>Fingerprint lock</span>
+        <${Segmented} label="Fingerprint lock" value=${s.lockId ? 'on' : 'off'} onChange=${(v) => onLock(v === 'on')} options=${[['off', 'Off'], ['on', 'On']]}/></div>
+      <p class="small muted">Asks for your fingerprint (or screen lock) when the app opens or returns after a minute in the background. It hides the screen from others; it doesn’t encrypt the data.</p>
     </div>
 
     <h2>Backup</h2>
@@ -555,6 +595,7 @@ function Settings({ state, saveSettings, onExport, onImport, onIbkr, onRefresh, 
     <h2>Data</h2>
     <div class="card form">
       <button class="btn" type="button" onClick=${() => onRefresh(true)}>Refresh prices now</button>
+      ${state.undo && html`<button class="btn" type="button" onClick=${onUndo}>Undo last import (${state.undo.label}, ${new Date(state.undo.at).toLocaleString('en-GB', { dateStyle: 'short', timeStyle: 'short' })})</button>`}
       <button class=${'btn ' + (confirmDel ? 'danger' : 'ghost')} type="button" disabled=${!state.lots.length} onClick=${() => (confirmDel ? (onDeleteAll(), setConfirmDel(false)) : setConfirmDel(true))}>
         ${confirmDel ? `Tap again: delete all ${state.lots.length} transactions from this phone` : 'Delete all transactions'}</button>
     </div>
@@ -573,6 +614,37 @@ function validTx(t) {
     case 'fx': return t.ils !== 0 && t.usd !== 0 && Math.sign(t.ils) === Math.sign(t.usd);
     default: return false;
   }
+}
+
+// ---------- fingerprint lock (WebAuthn platform authenticator; a privacy screen, not encryption) ----------
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+async function createLock() {
+  if (!window.PublicKeyCredential || !(await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable?.()))
+    throw new Error('This phone doesn’t offer fingerprint or screen-lock for web apps');
+  const cred = await navigator.credentials.create({ publicKey: {
+    challenge: crypto.getRandomValues(new Uint8Array(32)), rp: { name: 'Portfolio' },
+    user: { id: crypto.getRandomValues(new Uint8Array(16)), name: 'portfolio', displayName: 'Portfolio app' },
+    pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+    authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'discouraged' },
+    timeout: 60000, attestation: 'none' } });
+  return b64u(cred.rawId);
+}
+async function verifyLock(id) {
+  await navigator.credentials.get({ publicKey: { challenge: crypto.getRandomValues(new Uint8Array(32)),
+    allowCredentials: [{ type: 'public-key', id: unb64u(id) }], userVerification: 'required', timeout: 60000 } });
+}
+
+function LockScreen({ onUnlock, onDisable, fails }) {
+  useEffect(() => { onUnlock(); }, []);
+  const [sure, setSure] = useState(false);
+  return html`<div class="lock">
+    <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg>
+    <h1>Portfolio is locked</h1>
+    <button class="btn primary" onClick=${onUnlock}>Unlock with fingerprint</button>
+    ${fails >= 3 && html`<button class=${'btn ' + (sure ? 'danger' : 'ghost')} onClick=${() => (sure ? onDisable() : setSure(true))}>
+      ${sure ? 'Tap again to turn the lock off (your data stays)' : 'Fingerprint not working?'}</button>`}
+  </div>`;
 }
 
 // ---------- app ----------
@@ -598,9 +670,14 @@ function App() {
     (async () => {
       let meta = (await db.kvGet('meta')) || {};
       if (!meta.initialized) { meta = { initialized: true, created: Date.now() }; await db.kvSet('meta', meta); }
-      const [lots, quotes, fx, settings] = await Promise.all([db.getLots(), db.kvGet('quotes'), db.kvGet('fx'), db.kvGet('settings')]);
+      let [lots, quotes, fx, settings] = await Promise.all([db.getLots(), db.kvGet('quotes'), db.kvGet('fx'), db.kvGet('settings')]);
+      if (lots.some((t) => t.fxMode === 'conv')) { lots = lots.map((t) => (t.fxMode === 'conv' ? { ...t, fxMode: 'fifo' } : t)); await db.replaceLots(lots); }
       const persisted = await db.persist();
-      setState({ lots, quotes: quotes || {}, fx, settings: { ...DEFAULT_SETTINGS, ...settings }, meta, persisted, loading: false, pending: null });
+      const st = { ...DEFAULT_SETTINGS, ...settings };
+      if (st.rateMode === 'conv') st.rateMode = 'fifo'; // v1.2 "average" mode is replaced by exact FIFO matching
+      const undo = await db.kvGet('undo');
+      setState({ lots, quotes: quotes || {}, fx, settings: st, meta, persisted, loading: false, pending: null,
+        undo: undo && Date.now() - undo.at < 7 * 864e5 ? { at: undo.at, label: undo.label } : null, locked: !!st.lockId });
     })().catch((e) => toast('Could not open storage: ' + e.message, 'error', 8000));
   }, []);
 
@@ -617,7 +694,7 @@ function App() {
     patch({ loading: true });
     const errs = [];
     let fx = s.fx;
-    try { const r = await api.fxUsdIls(); fx = { ...r, fetchedAt: Date.now() }; await db.kvSet('fx', fx); } catch (e) { errs.push('USD/ILS: ' + e.message); }
+    try { const r = await api.officialRate('latest'); fx = { ...r, fetchedAt: Date.now() }; await db.kvSet('fx', fx); } catch (e) { errs.push('USD/ILS: ' + e.message); }
     let quotes = s.quotes;
     if (hasKey && tickers.length) {
       const res = await api.pool(tickers, 4, (t) => api.quote(t, s.settings));
@@ -653,6 +730,29 @@ function App() {
     return () => { window.removeEventListener('touchstart', start); window.removeEventListener('touchmove', move); window.removeEventListener('touchend', end); };
   }, []);
 
+  // New version published? (version.json is never cached)
+  const [newVersion, setNewVersion] = useState(null);
+  useEffect(() => {
+    const check = () => fetch('./version.json', { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null))
+      .then((j) => { if (j?.version && j.version !== VERSION) setNewVersion(j.version); }).catch(() => {});
+    check();
+    const t = setInterval(check, 30 * 60e3);
+    const vis = () => { if (document.visibilityState === 'visible') check(); };
+    document.addEventListener('visibilitychange', vis);
+    return () => { clearInterval(t); document.removeEventListener('visibilitychange', vis); };
+  }, []);
+  // Re-lock after a minute in the background
+  useEffect(() => {
+    let hiddenAt = 0;
+    const vis = () => {
+      if (document.visibilityState === 'hidden') hiddenAt = Date.now();
+      else if (hiddenAt && Date.now() - hiddenAt > 60e3 && stRef.current?.settings.lockId) patch({ locked: true });
+    };
+    document.addEventListener('visibilitychange', vis);
+    return () => document.removeEventListener('visibilitychange', vis);
+  }, []);
+  const [lockFails, setLockFails] = useState(0);
+
   if (!state) return html`<div class="loading">Loading…</div>`;
   HIDE = !!state.settings.hide;
   const ccy = state.settings.ccy;
@@ -666,22 +766,74 @@ function App() {
   }
   const reload = async () => patch({ lots: await db.getLots() });
 
+  // Throw away the saved copy, download every app file fresh (bypassing the browser cache), then restart.
+  async function applyUpdate() {
+    patch({ loading: true });
+    try {
+      await Promise.all((await caches.keys()).map((k) => caches.delete(k)));
+      const files = ['./', './index.html', './styles.css', './app.js', './calc.js', './db.js', './api.js', './ibkr.js', './xlsx.js', './preact-htm.mjs', './manifest.webmanifest', './sw.js'];
+      await Promise.all(files.map((u) => fetch(u, { cache: 'reload' }).catch(() => {})));
+      await (await navigator.serviceWorker?.getRegistration())?.update();
+    } catch {}
+    location.reload();
+  }
+  async function setLock(on) {
+    if (!on) { await saveSettings({ lockId: null }); return toast('Fingerprint lock off'); }
+    try { const id = await createLock(); await saveSettings({ lockId: id }); toast('Fingerprint lock on'); }
+    catch (e) { toast(e.name === 'NotAllowedError' ? 'Cancelled' : 'Couldn’t turn on the lock: ' + e.message, 'error', 8000); }
+  }
+  async function unlock() {
+    try { await verifyLock(state.settings.lockId); patch({ locked: false }); setLockFails(0); }
+    catch (e) { setLockFails((n) => n + 1); }
+  }
+  if (state.locked) {
+    return html`<${LockScreen} fails=${lockFails} onUnlock=${unlock} onDisable=${async () => { await saveSettings({ lockId: null }); patch({ locked: false }); }}/>
+      <${Toast} toast=${toastMsg} onClose=${() => setToastMsg(null)}/>`;
+  }
+
   // Official USD/ILS for many dates in one request.
   async function officialRates(dates) {
     const from = dates.reduce((a, d) => (d < a ? d : a), todayISO());
-    const start = new Date(Date.parse(from) - 7 * 864e5).toISOString().slice(0, 10); // a week earlier for weekends/holidays
-    const series = await api.fxSeries(start);
+    const start = new Date(Date.parse(from) - 10 * 864e5).toISOString().slice(0, 10); // earlier, for weekends/holidays
+    const series = await api.officialSeries(start);
     return (d) => api.rateOn(series, d);
   }
-  function buyRate(t, txns, official) {
-    if (stRef.current.settings.rateMode === 'conv') { const c = avgConversionRate(txns, t.date); if (c) return [c, 'conv']; }
-    return [official(t.date), 'official'];
+  // Assign each buy its shekel cost rate (unless the user typed one). Returns the updated list and how many changed.
+  // all=true ("Apply to all existing buys"): every buy follows the setting. Otherwise each buy keeps its own source.
+  async function withRates(txns, all = false) {
+    const mode = stRef.current.settings.rateMode;
+    const need = txns.filter((t) => txType(t) !== 'fx').map((t) => t.date);
+    if (!need.length) return { next: txns, changed: 0 };
+    const official = await officialRates(need);
+    // sells and dividends first: their rate feeds the dollar pool used by later buys
+    txns = txns.map((t) => ((txType(t) === 'sell' || txType(t) === 'div') && !(t.fx > 0) ? { ...t, fx: official(t.date), _new: 1 } : t));
+    const fifoMap = fifoBuyRates(txns, official);
+    let changed = 0;
+    const next = txns.map((t) => {
+      const ty = txType(t);
+      if (t._new) { changed++; const { _new, ...rest } = t; return rest; }
+      if (ty !== 'buy' || t.fxMode === 'manual') return t;
+      const useFifo = all || !t.fxMode || !(t.fxAtBuy > 0) ? mode === 'fifo' : t.fxMode === 'fifo';
+      if (!all && t.fxMode === 'official' && t.fxAtBuy > 0) return t; // already set, keep
+      const r = useFifo ? fifoMap.get(t.id).rate : official(t.date);
+      const m = useFifo ? 'fifo' : 'official';
+      if (!(r > 0)) return t;
+      if (Math.abs(r - (t.fxAtBuy || 0)) > 1e-9 || t.fxMode !== m) changed++;
+      return { ...t, fxAtBuy: r, fxMode: m };
+    });
+    return { next, changed };
+  }
+  // In "My conversions" mode every change can shift later buys' rates, so recompute quietly.
+  async function syncRates() {
+    if (!stRef.current.lots.some((t) => t.fxMode === 'fifo')) return;
+    try { const { next, changed } = await withRates(stRef.current.lots); if (changed) { await db.replaceLots(next); await reload(); } } catch {}
   }
 
   async function saveTx(t) {
     await db.putLot(t);
     await reload();
     toast('Saved');
+    await syncRates();
     const s = stRef.current;
     if (t.ticker && !s.quotes[t.ticker] && (s.settings.finnhubKey || s.settings.twelveKey)) {
       api.quote(t.ticker, s.settings).then(async (q) => {
@@ -696,6 +848,7 @@ function App() {
     await db.deleteLot(id);
     await reload();
     toast('Deleted');
+    await syncRates();
     if (txType(t) === 'fx') return leaveTo('#conversions');
     leaveTo(state.lots.some((l) => l.ticker === t.ticker && l.id !== id) ? '#t/' + encodeURIComponent(t.ticker) : '#holdings');
   }
@@ -763,52 +916,56 @@ function App() {
     try {
       const parsed = parseIbkr(text);
       if (!parsed.txns.length) throw new Error('No stock trades, conversions or dividends found in this file' + (parsed.skipped.length ? ` (${parsed.skipped.length} rows skipped)` : ''));
-      const plan = planImport(stRef.current.lots, parsed.txns);
-      patch({ pending: { plan, skipped: parsed.skipped, format: parsed.format, fileName } });
+      const plan = planImport(stRef.current.lots, parsed.txns, parsed.period);
+      patch({ pending: { plan, period: parsed.period, positions: parsed.positions, skipped: parsed.skipped, format: parsed.format, fileName } });
       go('#import');
     } catch (e) { toast('IBKR import: ' + e.message, 'error', 9000); }
   }
-  async function confirmIbkr() {
-    const { plan } = stRef.current.pending;
+  // What the transaction list would be after this import with the chosen options.
+  function resultOf(pending, opts) {
+    const remove = new Set([...pending.plan.removeIds, ...opts.nearIds, ...(opts.master ? pending.plan.manualIds : [])]);
+    return { remove, list: stRef.current.lots.filter((t) => !remove.has(t.id)).concat(pending.plan.add) };
+  }
+  async function confirmIbkr(opts) {
+    const pending = stRef.current.pending;
     try {
-      const remaining = stRef.current.lots.filter((t) => !plan.removeIds.includes(t.id));
-      const all = remaining.concat(plan.add);
-      const needs = plan.add.filter((t) => t.type !== 'fx').map((t) => t.date);
-      const official = needs.length ? await officialRates(needs) : null;
-      const add = plan.add.map((t) => {
-        if (t.type === 'buy') { const [r, m] = buyRate(t, all, official); return { ...t, fxAtBuy: r, fxMode: m }; }
-        if (t.type === 'sell' || t.type === 'div') return { ...t, fx: official(t.date) };
-        return t;
-      });
-      if (add.some((t) => t.type !== 'fx' && !((t.fxAtBuy ?? t.fx) > 0))) throw new Error('Missing exchange rate for some dates');
-      await db.replaceLots(remaining.concat(add));
+      const { remove, list } = resultOf(pending, opts);
+      const { next } = await withRates(list);
+      if (next.some((t) => txType(t) !== 'fx' && !((t.fxAtBuy ?? t.fx) > 0))) throw new Error('Missing exchange rate for some dates');
+      await db.kvSet('undo', { at: Date.now(), label: pending.fileName, lots: stRef.current.lots });
+      await db.replaceLots(next);
+      const check = checkPositions(next, pending.positions);
+      const meta = { ...stRef.current.meta, lastCheck: check, lastImport: Date.now() };
+      await db.kvSet('meta', meta);
       await reload();
-      patch({ pending: null });
-      toast(`Imported ${add.length} transactions${plan.removeIds.length ? ` · replaced ${plan.removeIds.length} manual buys` : ''}`, '', 6000);
+      patch({ pending: null, meta, undo: { at: Date.now(), label: pending.fileName } });
+      toast(`Imported ${pending.plan.add.length} transactions${remove.size ? ` · replaced ${remove.size} hand-entered` : ''}`, '', 6000);
       leaveTo('#holdings');
       refresh(true);
     } catch (e) { toast('Import failed: ' + e.message + ' (needs internet for exchange rates)', 'error', 9000); }
   }
+  async function undoImport() {
+    const u = await db.kvGet('undo');
+    if (!u) return toast('Nothing to undo');
+    await db.replaceLots(u.lots);
+    await db.kvDel('undo');
+    const meta = { ...stRef.current.meta, lastCheck: null };
+    await db.kvSet('meta', meta);
+    await reload();
+    patch({ undo: null, meta });
+    toast('Import undone — back to how it was before');
+  }
   async function recalcRates() {
     try {
-      const txns = stRef.current.lots;
-      const buys = txns.filter((t) => txType(t) === 'buy' && t.fxMode !== 'manual');
-      if (!buys.length) return toast('No buys to update');
-      const official = await officialRates(buys.map((b) => b.date));
-      let changed = 0;
-      const next = txns.map((t) => {
-        if (txType(t) !== 'buy' || t.fxMode === 'manual') return t;
-        const [r, m] = buyRate(t, txns, official);
-        if (!(r > 0)) return t;
-        if (Math.abs(r - t.fxAtBuy) > 1e-9 || t.fxMode !== m) changed++;
-        return { ...t, fxAtBuy: r, fxMode: m };
-      });
+      const { next, changed } = await withRates(stRef.current.lots, true);
       await db.replaceLots(next);
       await reload();
-      toast(`Updated the rate on ${changed} buys`, '', 5000);
+      toast(`Updated the rate on ${changed} transactions`, '', 5000);
     } catch (e) { toast('Couldn’t update rates: ' + e.message, 'error', 8000); }
   }
   async function deleteAll() {
+    await db.kvSet('undo', { at: Date.now(), label: 'Delete all', lots: stRef.current.lots });
+    patch({ undo: { at: Date.now(), label: 'Delete all' } });
     await db.replaceLots([]);
     await reload();
     toast('All transactions deleted');
@@ -821,12 +978,12 @@ function App() {
   const sub = route.form || route.ticker || route.page;
   let body;
   if (route.form) body = html`<${TxForm} key=${location.hash} route=${route} txns=${state.lots} pf=${pf} settings=${state.settings} onSave=${saveTx} onDelete=${deleteTx}/>`;
-  else if (route.page === 'import') body = html`<${ImportPreview} pending=${state.pending} onConfirm=${confirmIbkr} onCancel=${() => { patch({ pending: null }); back('settings'); }}/>`;
+  else if (route.page === 'import') body = html`<${ImportPreview} pending=${state.pending} resultOf=${resultOf} onConfirm=${confirmIbkr} onCancel=${() => { patch({ pending: null }); back('settings'); }}/>`;
   else if (route.page === 'conversions') body = html`<${Conversions} txns=${state.lots}/>`;
   else if (route.ticker) body = html`<${Detail} ticker=${route.ticker} pf=${pf} ccy=${ccy} quotes=${state.quotes}/>`;
-  else if (route.tab === 'holdings') body = html`<${Holdings} pf=${pf} ccy=${ccy} sort=${sort} setSort=${setSort}/>`;
-  else if (route.tab === 'settings') body = html`<${Settings} state=${view} saveSettings=${saveSettings} onExport=${exportBackup} onImport=${importAny} onIbkr=${importAny} onRefresh=${refresh} onDeleteAll=${deleteAll} onRecalc=${recalcRates} toast=${toast}/>`;
-  else body = html`<${Home} pf=${pf} ccy=${ccy} setCcy=${(v) => saveSettings({ ccy: v })} state=${view} onExport=${exportBackup} onImport=${importAny} onIbkr=${importAny}/>`;
+  else if (route.tab === 'holdings') body = html`<${Holdings} pf=${pf} ccy=${ccy} sort=${sort} setSort=${setSort} check=${state.meta.lastCheck}/>`;
+  else if (route.tab === 'settings') body = html`<${Settings} state=${view} saveSettings=${saveSettings} onExport=${exportBackup} onImport=${importAny} onIbkr=${importAny} onRefresh=${refresh} onDeleteAll=${deleteAll} onRecalc=${recalcRates} onUndo=${undoImport} onLock=${setLock} toast=${toast}/>`;
+  else body = html`<${Home} pf=${pf} ccy=${ccy} setCcy=${(v) => saveSettings({ ccy: v })} state=${view} onExport=${exportBackup} onImport=${importAny} onIbkr=${importAny} onUndo=${undoImport}/>`;
 
   const showEye = !route.form && route.tab !== 'settings';
   return html`
@@ -838,6 +995,7 @@ function App() {
       <h1>${title}</h1>
       ${!route.form && !route.page ? html`<button class=${'icon ' + (state.loading ? 'spin' : '')} aria-label="Refresh prices" onClick=${() => refresh(true)}><${Icon} d=${I.refresh}/></button>` : html`<span class="icon-space"></span>`}
     </header>
+    ${newVersion && html`<button class="update" onClick=${applyUpdate}>New version ${newVersion} — tap to update</button>`}
     <main>${body}</main>
     ${!route.form && !route.page && route.tab !== 'settings' && state.lots.length > 0 && html`<button class="fab" aria-label="Add a transaction" onClick=${() => go('#tx/new/buy/' + (route.ticker || ''))}><${Icon} d=${I.plus} size=${26}/></button>`}
     <nav class="tabs">
@@ -850,6 +1008,6 @@ function App() {
 history.replaceState('root', '', location.hash || '#home');
 render(html`<${App}/>`, document.getElementById('app'));
 
-if ('serviceWorker' in navigator && location.protocol === 'https:') {
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || new URLSearchParams(location.search).has('sw'))) {
   navigator.serviceWorker.register('./sw.js').catch(() => {});
 }

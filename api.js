@@ -1,5 +1,15 @@
 // One adapter per source: fetch + normalise only.
 
+async function getText(url, ms = 15000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { signal: ctl.signal });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.text();
+  } finally { clearTimeout(timer); }
+}
+
 async function getJSON(url, ms = 10000) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), ms);
@@ -90,4 +100,48 @@ export function rateOn(series, date) {
   let best = null;
   for (const d in series) if (d <= date && (!best || d > best)) best = d;
   return best ? series[best] : null;
+}
+
+// ---------- official USD/ILS: Bank of Israel representative rate, with Frankfurter as fallback ----------
+const isoMinus = (iso, days) => new Date(Date.parse(iso) - days * 864e5).toISOString().slice(0, 10);
+const todayUTC = () => new Date().toISOString().slice(0, 10);
+export const rateInfo = { source: null }; // 'boi' | 'ecb'
+
+async function boiSeries(from) {
+  const url = `https://edge.boi.gov.il/FusionEdgeServer/sdmx/v2/data/dataflow/BOI.STATISTICS/EXR/1.0/RER_USD_ILS?startperiod=${from}&format=csv`;
+  const text = await getText(url);
+  const lines = text.trim().split(/\r?\n/);
+  const head = lines[0].split(',').map((h) => h.replace(/"/g, '').trim().toUpperCase());
+  const iT = head.indexOf('TIME_PERIOD'), iV = head.indexOf('OBS_VALUE');
+  if (iT < 0 || iV < 0) throw new Error('Unexpected Bank of Israel format');
+  const out = {};
+  for (const l of lines.slice(1)) {
+    const c = l.split(',').map((x) => x.replace(/"/g, '').trim());
+    const d = c[iT], v = Number(c[iV]);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(d) && v > 1 && v < 10) out[d] = v;
+  }
+  if (!Object.keys(out).length) throw new Error('No Bank of Israel rates');
+  return out;
+}
+
+let cache = null; // {from, day, series, source}
+export async function officialSeries(from) {
+  const day = todayUTC();
+  if (cache && cache.day === day && cache.from <= from) return cache.series;
+  let series, source;
+  try { series = await boiSeries(from); source = 'boi'; }
+  catch { series = await fxSeries(from); source = 'ecb'; }
+  rateInfo.source = source;
+  cache = { from, day, series, source };
+  return series;
+}
+
+// Official rate on a date ('latest' = most recent published). Returns {rate, date, source}.
+export async function officialRate(date = 'latest') {
+  const d = date === 'latest' || date >= todayUTC() ? todayUTC() : date;
+  const series = await officialSeries(isoMinus(d, 10));
+  let best = null;
+  for (const k in series) if (k <= d && (!best || k > best)) best = k;
+  if (!best) throw new Error('No USD/ILS rate for ' + d);
+  return { rate: series[best], date: best, source: rateInfo.source };
 }
