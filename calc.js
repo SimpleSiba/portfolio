@@ -68,34 +68,98 @@ function sumUp(items) {
   };
 }
 
-// lots: array, quotes: {TICKER: {price, prevClose}}, fxNow: number
-export function portfolio(lots, quotes, fxNow, today = todayISO()) {
-  const byTicker = new Map();
-  const all = [];
-  for (const lot of lots) {
-    const m = { lot, ...lotMetrics(lot, quotes[lot.ticker], fxNow, today) };
-    all.push(m);
-    if (!byTicker.has(lot.ticker)) byTicker.set(lot.ticker, []);
-    byTicker.get(lot.ticker).push(m);
+export const txType = (t) => t.type || 'buy';
+
+// Average ILS paid per USD over all logged conversions up to `date` (inclusive). null if none.
+export function avgConversionRate(txns, date = '9999-12-31') {
+  let ils = 0, usd = 0;
+  for (const t of txns) if (txType(t) === 'fx' && t.date <= date) { ils += t.ils; usd += t.usd; }
+  return usd > 0 ? ils / usd : null;
+}
+
+const EPS = 1e-9;
+
+// txns: buys / sells / dividends / conversions. quotes: {TICKER: {price, prevClose}}, fxNow: ILS per USD.
+// Sells consume buys first-in-first-out (FIFO), as IBKR and the Israeli tax authority do.
+export function portfolio(txns, quotes, fxNow, today = todayISO()) {
+  const groups = new Map();
+  const g = (tk) => { if (!groups.has(tk)) groups.set(tk, { buys: [], sells: [], divs: [] }); return groups.get(tk); };
+  for (const t of txns) {
+    const ty = txType(t);
+    if (ty === 'buy') g(t.ticker).buys.push(t);
+    else if (ty === 'sell') g(t.ticker).sells.push(t);
+    else if (ty === 'div') g(t.ticker).divs.push(t);
   }
-  const holdings = [...byTicker.entries()].map(([ticker, ms]) => {
-    const shares = ms.reduce((a, m) => a + m.lot.shares, 0);
-    const s = sumUp(ms);
+  const holdings = [];
+  const allOpen = [];
+  const warnings = [];
+  const agg = { realizedUsd: 0, realizedIls: 0, divUsd: 0, divIls: 0, divTaxUsd: 0, investedAllUsd: 0, investedAllIls: 0 };
+
+  for (const [ticker, grp] of groups) {
+    const events = [...grp.buys.map((t) => [0, t]), ...grp.sells.map((t) => [1, t])]
+      .sort((a, b) => a[1].date.localeCompare(b[1].date) || a[0] - b[0]);
+    const open = [];
+    let realizedUsd = 0, realizedIls = 0, oversold = 0, investedAllUsd = 0, investedAllIls = 0;
+    for (const [k, t] of events) {
+      if (k === 0) {
+        const cost = t.shares * t.priceUsd + (t.feesUsd || 0);
+        investedAllUsd += cost; investedAllIls += cost * t.fxAtBuy;
+        open.push({ lot: t, remaining: t.shares });
+        continue;
+      }
+      let q = t.shares, costUsd = 0, costIls = 0;
+      while (q > EPS && open.length) {
+        const o = open[0];
+        const take = Math.min(q, o.remaining);
+        const per = (o.lot.shares * o.lot.priceUsd + (o.lot.feesUsd || 0)) / o.lot.shares;
+        costUsd += take * per; costIls += take * per * o.lot.fxAtBuy;
+        o.remaining -= take; q -= take;
+        if (o.remaining <= EPS) open.shift();
+      }
+      if (q > EPS) { oversold += q; warnings.push(`${ticker}: sold ${+q.toFixed(4)} more shares than bought on ${t.date}`); }
+      const sold = t.shares - q;
+      const net = sold * t.priceUsd - (t.feesUsd || 0);
+      realizedUsd += net - costUsd;
+      realizedIls += net * t.fx - costIls;
+    }
+    let divUsd = 0, divIls = 0, divTaxUsd = 0;
+    for (const d of grp.divs) { const n = d.grossUsd - (d.taxUsd || 0); divUsd += n; divIls += n * d.fx; divTaxUsd += d.taxUsd || 0; }
+
+    const ms = open.map((o) => {
+      const f = o.remaining / o.lot.shares;
+      const lot = { ...o.lot, shares: o.remaining, feesUsd: (o.lot.feesUsd || 0) * f };
+      return { lot: o.lot, openShares: o.remaining, ...lotMetrics(lot, quotes[ticker], fxNow, today) };
+    });
+    allOpen.push(...ms);
+    const shares = ms.reduce((a, m) => a + m.openShares, 0);
+    const closed = shares <= EPS;
+    const s = closed ? { ...sumUp([]), valueUsd: 0, valueIls: 0, plUsd: 0, plIls: 0, retUsd: null, retIls: null, stockEffectIls: 0, fxEffectIls: 0 } : sumUp(ms);
     const q = quotes[ticker];
-    return {
-      ticker,
-      shares,
-      avgCostUsd: shares > 0 ? s.costUsd / shares : 0,
+    const totalPlUsd = s.plUsd == null ? null : s.plUsd + realizedUsd + divUsd;
+    const totalPlIls = s.plIls == null ? null : s.plIls + realizedIls + divIls;
+    holdings.push({
+      ticker, shares, closed, oversold,
+      avgCostUsd: shares > EPS ? s.costUsd / shares : 0,
       price: q && q.price > 0 ? q.price : null,
       dayPct: q && q.prevClose > 0 && q.price > 0 ? q.price / q.prevClose - 1 : null,
       lots: ms.sort((a, b) => b.lot.date.localeCompare(a.lot.date)),
+      buys: grp.buys, sells: grp.sells, divs: grp.divs,
       ...s,
-    };
-  });
-  const total = sumUp(all);
-  for (const h of holdings) {
-    h.weight = total.valueIls > 0 && h.valueIls ? h.valueIls / total.valueIls : 0;
+      realizedUsd, realizedIls, divUsd, divIls, divTaxUsd, investedAllUsd, investedAllIls,
+      totalPlUsd, totalPlIls,
+      totalRetUsd: totalPlUsd == null ? null : ret(investedAllUsd, investedAllUsd + totalPlUsd),
+      totalRetIls: totalPlIls == null ? null : ret(investedAllIls, investedAllIls + totalPlIls),
+    });
+    for (const k of Object.keys(agg)) agg[k] += { realizedUsd, realizedIls, divUsd, divIls, divTaxUsd, investedAllUsd, investedAllIls }[k];
   }
+
+  const total = { ...sumUp(allOpen), ...agg, warnings };
+  if (!allOpen.length) Object.assign(total, { valueUsd: 0, valueIls: 0, plUsd: 0, plIls: 0, stockEffectIls: 0, fxEffectIls: 0 });
+  total.totalPlUsd = total.plUsd == null ? null : total.plUsd + agg.realizedUsd + agg.divUsd;
+  total.totalPlIls = total.plIls == null ? null : total.plIls + agg.realizedIls + agg.divIls;
+  total.totalRetUsd = total.totalPlUsd == null ? null : ret(agg.investedAllUsd, agg.investedAllUsd + total.totalPlUsd);
+  total.totalRetIls = total.totalPlIls == null ? null : ret(agg.investedAllIls, agg.investedAllIls + total.totalPlIls);
+  for (const h of holdings) h.weight = total.valueIls > 0 && h.valueIls ? h.valueIls / total.valueIls : 0;
   return { holdings, total };
 }
 

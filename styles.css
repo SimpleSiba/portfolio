@@ -125,3 +125,18 @@ nav.tabs button.on, nav.tabs button.half { color: var(--accent); }
 .step.done .n { background: var(--gain); }
 .btns { display: flex; gap: 8px; flex-wrap: wrap; }
 .status a { color: var(--accent); }
+
+.tag { display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; padding: 1px 6px; border-radius: 6px; background: var(--line); margin-right: 4px; vertical-align: 1px; }
+.tag.buy { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.tag.sell { background: var(--warn-bg); color: var(--warn); }
+.tag.div { background: var(--gain-bg); color: var(--gain); }
+.tag.fx { background: var(--line); }
+.plain { list-style: none; padding: 0; margin: 8px 0; display: grid; gap: 4px; }
+.wide3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+.steps-list { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+.seg button:disabled { opacity: .4; }
+.form .seg { align-self: flex-start; }
+details summary { cursor: pointer; color: var(--muted); }
+.hero .sub.small { font-size: 13px; }
+.breakdown { display: flex; flex-wrap: wrap; gap: 2px 12px; }
+.plain li { font-weight: 600; }

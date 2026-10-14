@@ -75,3 +75,19 @@ export async function pool(items, n, fn) {
   await Promise.all(workers);
   return out;
 }
+
+// Daily USD→ILS rates from `from` (YYYY-MM-DD) to today: {date: rate}, business days only.
+export async function fxSeries(from) {
+  const j = await getJSON(`https://api.frankfurter.dev/v1/${from}..?base=USD&symbols=ILS`, 20000);
+  const out = {};
+  for (const [d, r] of Object.entries(j?.rates || {})) if (r?.ILS) out[d] = r.ILS;
+  if (!Object.keys(out).length) throw new Error('No USD/ILS history');
+  return out;
+}
+
+// Rate on `date`, or the last business day before it.
+export function rateOn(series, date) {
+  let best = null;
+  for (const d in series) if (d <= date && (!best || d > best)) best = d;
+  return best ? series[best] : null;
+}
