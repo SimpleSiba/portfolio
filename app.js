@@ -4,7 +4,7 @@ import * as api from './api.js';
 import { portfolio, isStale, todayISO, txType, avgConversionRate } from './calc.js';
 import { parseIbkr, planImport } from './ibkr.js';
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const DEFAULT_SETTINGS = { finnhubKey: '', twelveKey: '', ccy: 'ILS', hide: false, rateMode: 'official' };
 const MIN_REFRESH_MS = 60e3;
 
@@ -110,8 +110,8 @@ function FilePick({ accept, onFile, children, cls = 'btn' }) {
   return html`<button type="button" class=${cls} onClick=${() => ref.current.click()}>${children}</button>
     <input type="file" accept=${accept} ref=${ref} hidden onChange=${(e) => { const f = e.target.files[0]; e.target.value = ''; if (f) onFile(f); }}/>`;
 }
-const ACCEPT_BACKUP = 'application/json,.json,text/plain,.txt';
-const ACCEPT_CSV = '.csv,text/csv,text/comma-separated-values,application/vnd.ms-excel,text/plain';
+const ACCEPT_BACKUP = 'application/json,.json,text/plain,.txt,.csv,text/csv,text/comma-separated-values';
+const ACCEPT_CSV = '.csv,text/csv,text/comma-separated-values,application/vnd.ms-excel,text/plain,.txt,.json,application/json';
 
 // ---------- screens ----------
 function Welcome({ state, onImport, onIbkr }) {
@@ -162,8 +162,8 @@ function Home({ pf, ccy, setCcy, state, onExport, onImport, onIbkr }) {
       </div>
       ${extra && html`<div class="sub small muted breakdown">
         <span>Open <span class=${tone(total['pl' + C])}>${fmtSigned(total['pl' + C], ccy)}</span></span>
-        <span>Realised <span class=${tone(total['realized' + C])}>${fmtSigned(total['realized' + C], ccy)}</span></span>
-        <span>Dividends <span class=${tone(total['div' + C])}>${fmtSigned(total['div' + C], ccy)}</span></span></div>`}
+        ${Math.abs(total['realized' + C]) > 1e-9 && html`<span>Realised <span class=${tone(total['realized' + C])}>${fmtSigned(total['realized' + C], ccy)}</span></span>`}
+        ${Math.abs(total['div' + C]) > 1e-9 && html`<span>Dividends <span class=${tone(total['div' + C])}>${fmtSigned(total['div' + C], ccy)}</span></span>`}</div>`}
       <div class="sub">
         ${open.some((h) => h.dayPct != null)
           ? html`<span class=${'num ' + tone(total['day' + C])}>${fmtSigned(total['day' + C], ccy)} (${fmtPct(total['dayPct' + C])})</span><span class="muted"> today</span>`
@@ -461,7 +461,7 @@ function Conversions({ txns }) {
       ${list.length === 0 && html`<p class="muted small" style="padding:14px 16px">No conversions yet.</p>`}
       ${list.map((t) => html`<button class="hrow" onClick=${() => go('#tx/' + encodeURIComponent(t.id))}>
         <div class="l"><div>${fmtDate(t.date)}${t.source === 'ibkr' ? html` <span class="muted small">· IBKR</span>` : ''}</div>
-          <div class="muted small">${fmtMoney(t.ils, 'ILS', 2)} → ${fmtMoney(t.usd, 'USD', 2)}</div></div>
+          <div class="muted small">${t.usd > 0 ? html`${fmtMoney(t.ils, 'ILS', 2)} → ${fmtMoney(t.usd, 'USD', 2)}` : html`${fmtMoney(-t.usd, 'USD', 2)} → ${fmtMoney(-t.ils, 'ILS', 2)} (dollars sold)`}</div></div>
         <div class="r num">₪${(t.ils / t.usd).toFixed(4)}</div>
         <span class="muted"><${Icon} d=${I.chev} size=${18}/></span>
       </button>`)}
@@ -569,7 +569,7 @@ function validTx(t) {
     case 'buy': return !!t.ticker && t.shares > 0 && t.priceUsd > 0 && t.fxAtBuy > 0;
     case 'sell': return !!t.ticker && t.shares > 0 && t.priceUsd > 0 && t.fx > 0;
     case 'div': return !!t.ticker && t.grossUsd > 0 && t.fx > 0;
-    case 'fx': return t.ils > 0 && t.usd > 0;
+    case 'fx': return t.ils !== 0 && t.usd !== 0 && Math.sign(t.ils) === Math.sign(t.usd);
     default: return false;
   }
 }
@@ -728,9 +728,17 @@ function App() {
     await db.kvSet('meta', meta); patch({ meta });
     toast(`${how} · ${state.lots.length} transactions`, '', 6000);
   }
-  async function importBackup(file) {
+  // Any file button accepts either kind of file: a backup (JSON) or an IBKR statement (CSV).
+  async function importAny(file) {
+    let text;
+    try { text = await file.text(); } catch (e) { return toast('Couldn’t read the file: ' + e.message, 'error', 9000); }
+    const head = text.replace(/^[\uFEFF\u200B\s]+/, '');
+    if (head.startsWith('{')) return importBackup(head);
+    return pickIbkr(head, file.name);
+  }
+  async function importBackup(text) {
     try {
-      const data = JSON.parse(await file.text());
+      const data = JSON.parse(text);
       const list = Array.isArray(data.transactions) ? data.transactions : data.lots;
       if (data.app !== 'portfolio' || !Array.isArray(list)) throw new Error('Not a portfolio backup file');
       const bad = list.find((t) => !validTx(t));
@@ -745,12 +753,12 @@ function App() {
       refresh(true);
     } catch (e) { toast('Import failed: ' + e.message, 'error', 8000); }
   }
-  async function pickIbkr(file) {
+  async function pickIbkr(text, fileName) {
     try {
-      const parsed = parseIbkr(await file.text());
+      const parsed = parseIbkr(text);
       if (!parsed.txns.length) throw new Error('No stock trades, conversions or dividends found in this file' + (parsed.skipped.length ? ` (${parsed.skipped.length} rows skipped)` : ''));
       const plan = planImport(stRef.current.lots, parsed.txns);
-      patch({ pending: { plan, skipped: parsed.skipped, format: parsed.format, fileName: file.name } });
+      patch({ pending: { plan, skipped: parsed.skipped, format: parsed.format, fileName } });
       go('#import');
     } catch (e) { toast('IBKR import: ' + e.message, 'error', 9000); }
   }
@@ -811,8 +819,8 @@ function App() {
   else if (route.page === 'conversions') body = html`<${Conversions} txns=${state.lots}/>`;
   else if (route.ticker) body = html`<${Detail} ticker=${route.ticker} pf=${pf} ccy=${ccy} quotes=${state.quotes}/>`;
   else if (route.tab === 'holdings') body = html`<${Holdings} pf=${pf} ccy=${ccy} sort=${sort} setSort=${setSort}/>`;
-  else if (route.tab === 'settings') body = html`<${Settings} state=${view} saveSettings=${saveSettings} onExport=${exportBackup} onImport=${importBackup} onIbkr=${pickIbkr} onRefresh=${refresh} onDeleteAll=${deleteAll} onRecalc=${recalcRates} toast=${toast}/>`;
-  else body = html`<${Home} pf=${pf} ccy=${ccy} setCcy=${(v) => saveSettings({ ccy: v })} state=${view} onExport=${exportBackup} onImport=${importBackup} onIbkr=${pickIbkr}/>`;
+  else if (route.tab === 'settings') body = html`<${Settings} state=${view} saveSettings=${saveSettings} onExport=${exportBackup} onImport=${importAny} onIbkr=${importAny} onRefresh=${refresh} onDeleteAll=${deleteAll} onRecalc=${recalcRates} toast=${toast}/>`;
+  else body = html`<${Home} pf=${pf} ccy=${ccy} setCcy=${(v) => saveSettings({ ccy: v })} state=${view} onExport=${exportBackup} onImport=${importAny} onIbkr=${importAny}/>`;
 
   const showEye = !route.form && route.tab !== 'settings';
   return html`

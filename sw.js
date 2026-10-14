@@ -1,5 +1,5 @@
 // App shell cache. API calls always go to the network (data is cached in IndexedDB by the app).
-const CACHE = 'portfolio-v1.2.0';
+const CACHE = 'portfolio-v1.2.1';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './calc.js', './db.js', './api.js', './ibkr.js',
   './preact-htm.mjs', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 

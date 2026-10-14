@@ -111,12 +111,16 @@ function parseFlex(rows) {
 }
 
 export function parseIbkr(text) {
-  const rows = parseCsv(text);
+  text = String(text).replace(/^[\uFEFF\u200B\s]+/, '');
+  // Some spreadsheet apps re-save CSVs with semicolons
+  const first = text.split(/\r?\n/, 1)[0] || '';
+  if (!first.includes(',') && first.includes(';')) text = text.replace(/;/g, ',');
+  const rows = parseCsv(text).map((r) => r.map((c, i) => (i < 2 ? c.trim() : c)));
   if (!rows.length) throw new Error('The file is empty');
   if (rows.some((r) => r[1] === 'Header')) return parseActivity(rows);
   const h = rows[0];
   if (h.includes('Symbol') && h.includes('Quantity') && (h.includes('TradePrice') || h.includes('T. Price') || h.includes('Price'))) return parseFlex(rows);
-  throw new Error('This doesn’t look like an Interactive Brokers CSV (Activity Statement or Flex Query)');
+  throw new Error(`This doesn’t look like an Interactive Brokers CSV (Activity Statement or Flex Query). It starts with: “${first.slice(0, 60)}”`);
 }
 
 // Decide what an import changes. Manual buys (not from IBKR) that match an imported day's buys
