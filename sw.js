@@ -1,7 +1,7 @@
 // Opens instantly from the saved copy; refreshes the saved copy in the background.
 // The app itself checks version.json and offers "New version — tap to reload".
-const CACHE = 'portfolio-v1.3.0';
-const SHELL = ['./', './index.html', './styles.css', './app.js', './calc.js', './db.js', './api.js', './ibkr.js', './xlsx.js',
+const CACHE = 'portfolio-v2.0.0';
+const SHELL = ['./', './index.html', './styles.css', './app.js', './calc.js', './db.js', './api.js', './ibkr.js', './xlsx.js', './history.js', './charts.js',
   './preact-htm.mjs', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {

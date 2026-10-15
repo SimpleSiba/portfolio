@@ -4,8 +4,10 @@ import * as api from './api.js';
 import { portfolio, isStale, todayISO, txType, fifoBuyRates } from './calc.js';
 import { parseIbkr, planImport, checkPositions } from './ibkr.js';
 import { xlsxRows, rowsToCsv } from './xlsx.js';
+import { buildHistory, changeOver, rangeStart } from './history.js';
+import { LineChart } from './charts.js';
 
-const VERSION = '1.3.0';
+const VERSION = '2.0.0';
 const DEFAULT_SETTINGS = { finnhubKey: '', twelveKey: '', ccy: 'ILS', hide: false, rateMode: 'official', lockId: null };
 const MIN_REFRESH_MS = 60e3;
 
@@ -27,6 +29,14 @@ const fmtPct = (p, dec = 2) => (p == null || !isFinite(p) ? '—' : (p > 0 ? '+'
 const fmtNum = (v, dec = 4) => (v == null ? '—' : Number(v.toFixed(dec)).toLocaleString('en-US', { maximumFractionDigits: dec }));
 const fmtShares = (v) => (HIDE ? '••' : fmtNum(v));
 const tone = (v) => (v == null || Math.abs(v) < 1e-9 ? '' : v > 0 ? 'gain' : 'loss');
+function fmtCompact(v, ccy) {
+  if (HIDE) return '';
+  const sym = ccy === 'ILS' ? '₪' : '$', a = Math.abs(v), sign = v < 0 ? MINUS : '';
+  const t = (x, d) => x.toFixed(d).replace(/\.0$/, '');
+  if (a >= 1e6) return sign + sym + t(a / 1e6, a >= 1e7 ? 0 : 1) + 'M';
+  if (a >= 1e3) return sign + sym + t(a / 1e3, a >= 1e4 ? 0 : 1) + 'k';
+  return sign + sym + t(a, a < 10 && a > 0 ? 1 : 0);
+}
 const fmtDate = (iso) => { const [y, m, d] = iso.split('-'); return `${d}/${m}/${y}`; };
 function fmtAgo(ts) {
   if (!ts) return 'never';
@@ -45,6 +55,7 @@ function parseRoute(hash = location.hash) {
   const p = hash.replace(/^#\/?/, '').split('/').map(decodeURIComponent);
   if (p[0] === 'holdings') return { tab: 'holdings' };
   if (p[0] === 'settings') return { tab: 'settings' };
+  if (p[0] === 'charts') return { tab: 'charts' };
   if (p[0] === 'import') return { tab: 'settings', page: 'import' };
   if (p[0] === 'conversions') return { tab: 'settings', page: 'conversions' };
   if (p[0] === 't' && p[1]) return { tab: 'holdings', ticker: p[1] };
@@ -76,6 +87,7 @@ const I = {
   plus: 'M12 5v14M5 12h14',
   back: 'M15 18l-6-6 6-6',
   chev: 'M9 18l6-6-6-6',
+  chart: 'M3 3v18h18M7 15l4-5 4 3 5-7',
   eye: 'M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12zM12 15a3 3 0 100-6 3 3 0 000 6z',
   eyeOff: 'M17.9 17.9A10.7 10.7 0 0112 20C5 20 1 12 1 12a19.8 19.8 0 015.1-5.9M9.9 4.2A10 10 0 0112 4c7 0 11 8 11 8a19.9 19.9 0 01-2.2 3.2M1 1l22 22M14.1 14.1a3 3 0 01-4.2-4.2',
 };
@@ -236,7 +248,7 @@ function Holdings({ pf, ccy, sort, setSort, check }) {
   </section>`;
 }
 
-function Detail({ ticker, pf, ccy, quotes }) {
+function Detail({ ticker, pf, ccy, quotes, closes, txns, range, setRange }) {
   const h = pf.holdings.find((x) => x.ticker === ticker);
   const C = ccy === 'ILS' ? 'Ils' : 'Usd';
   if (!h) return html`<section><p class="muted">No transactions for ${ticker}.</p><button class="btn" onClick=${() => go('#tx/new/buy/' + ticker)}>Add a buy</button></section>`;
@@ -255,6 +267,10 @@ function Detail({ ticker, pf, ccy, quotes }) {
   stats.push(['Total P/L', S(h['totalPl' + C])], ['Total return', html`<span class=${tone(h['totalRet' + C])}>${fmtPct(h['totalRet' + C])}</span>`],
     ['Per year', h['ann' + C] != null ? html`<span class=${tone(h['ann' + C])}>${fmtPct(h['ann' + C], 1)}</span>` : html`<span class="muted small">${h.annShort ? 'after 1 year' : '—'}</span>`]);
   if (!h.closed) stats.push(['Weight', fmtPct(h.weight, 1).replace('+', '')], ['Today', S(h['day' + C])]);
+  if (closes && h.price) {
+    const m1 = changeOver(closes, h.price, 30, todayISO()), y1 = changeOver(closes, h.price, 365, todayISO());
+    stats.push(['Price, 1 month', html`<span class=${tone(m1)}>${fmtPct(m1, 1)}</span>`], ['Price, 1 year', html`<span class=${tone(y1)}>${fmtPct(y1, 1)}</span>`]);
+  }
   if (ccy === 'ILS' && !h.closed) stats.push(['Stock effect', S(h.stockEffectIls)], ['Currency effect', S(h.fxEffectIls)]);
   const openBy = new Map(h.lots.map((m) => [m.lot.id, m]));
   const activity = [...h.buys, ...h.sells, ...h.divs].sort((a, b) => b.date.localeCompare(a.date) || txType(a).localeCompare(txType(b)));
@@ -266,7 +282,8 @@ function Detail({ ticker, pf, ccy, quotes }) {
     </div>
     ${h.oversold > 0 && html`<div class="banner warn">Sells exceed buys by ${fmtNum(h.oversold)} shares. Check the transactions below.</div>`}
     <div class="card grid">${stats.map(([k, v]) => html`<div><div class="label">${k}</div><div class="num">${v}</div></div>`)}</div>
-    <div class="card placeholder muted small">Price chart since first buy — coming in v2</div>
+    ${closes ? html`<${PriceChart} ticker=${ticker} closes=${closes} live=${h.price} txns=${txns} range=${range} setRange=${setRange}/>`
+      : html`<div class="card placeholder muted small">Price chart appears once price history is downloaded (Charts tab).</div>`}
     <h2>Activity</h2>
     <div class="card list">
       ${activity.map((t) => {
@@ -302,6 +319,105 @@ function Detail({ ticker, pf, ccy, quotes }) {
       <button class="btn" onClick=${() => go('#tx/new/div/' + ticker)}>+ Dividend</button>
     </div>
   </section>`;
+}
+
+
+const RANGES = [['1M', '1M'], ['3M', '3M'], ['6M', '6M'], ['1Y', '1Y'], ['ALL', 'All']];
+
+function HistoryStatus({ hist, onRetry, noKey }) {
+  if (noKey) return html`<div class="card"><p>Charts need a free <b>Twelve Data</b> key for price history.</p><button class="btn small" onClick=${() => goTab('settings')}>Add it in Settings</button></div>`;
+  if (!hist || hist.status === 'idle') return null;
+  if (hist.status === 'loading') return html`<div class="status"><span class="dot busy"></span>Downloading price history ${hist.done}/${hist.total}${hist.waiting ? ' · Twelve Data allows 8 per minute, waiting…' : '…'}</div>`;
+  return html`<div class="status">
+    <span class=${'dot ' + (hist.errors?.length ? 'stale' : 'fresh')}></span>
+    ${hist.errors?.length ? `${hist.errors.length} couldn’t load: ${hist.errors.join(' · ')}` : `History up to ${fmtDate(hist.updated || todayISO())}`}
+    ${hist.errors?.length ? html` · <a href="#" onClick=${(e) => { e.preventDefault(); onRetry(); }}>retry</a>` : ''}
+  </div>`;
+}
+
+function Charts({ data, ccy, hist, onRetry, noKey, range, setRange }) {
+  if (noKey || !data) return html`<section><${HistoryStatus} hist=${hist} onRetry=${onRetry} noKey=${noKey}/>
+    ${!noKey && hist?.status !== 'loading' && html`<div class="card placeholder muted small">No history yet.</div>`}</section>`;
+  const C = ccy === 'ILS' ? 'Ils' : 'Usd';
+  const i0 = rangeStart(data.dates, range, todayISO());
+  const sl = (a) => a.slice(i0);
+  const dates = sl(data.dates);
+  const val = sl(data['value' + C]), inv = sl(data['invested' + C]), bench = sl(data['bench' + C]);
+  const last = val.length - 1;
+  const f = (v) => fmtMoney(v, ccy);
+  const ax = (v) => fmtCompact(v, ccy);
+  const profitNow = val[last] - inv[last], profitStart = val[0] - inv[0];
+  const benchEdge = val[last] != null && bench[last] != null ? val[last] - bench[last] : null;
+  return html`<section>
+    <div class="chips" role="group" aria-label="Time range">
+      ${RANGES.map(([k, t]) => html`<button class=${'chip ' + (range === k ? 'on' : '')} aria-pressed=${range === k} onClick=${() => setRange(k)}>${t}</button>`)}
+    </div>
+    <${HistoryStatus} hist=${hist} onRetry=${onRetry}/>
+    ${data.missing.length > 0 && html`<div class="banner warn">No price history for ${data.missing.join(', ')} — left out of the charts.</div>`}
+
+    <div class="card chart-card">
+      <h3>Value vs money invested</h3>
+      <p class="kpi"><b class="num">${f(val[last])}</b> <span class=${'num ' + tone(profitNow)}>${fmtSigned(profitNow, ccy)}</span> <span class="muted small">profit now</span></p>
+      ${range !== 'ALL' && html`<p class="small muted">Profit changed <span class=${tone(profitNow - profitStart)}>${fmtSigned(profitNow - profitStart, ccy)}</span> in this period (new money doesn’t count as gain).</p>`}
+      <${LineChart} label="Portfolio value and money invested over time" dates=${dates} fmt=${f} axisFmt=${ax}
+        series=${[{ label: 'Value', values: val, color: 'var(--s1)' }, { label: 'Money invested', values: inv, color: 'var(--ref)', dash: true }]}/>
+      <p class="small muted">Money invested = what you paid for the shares you still hold. The gap between the lines is your profit.</p>
+    </div>
+
+    <div class="card chart-card">
+      <h3>You vs the S&P 500</h3>
+      <p class="kpi">${benchEdge == null ? '' : html`<span class=${'num ' + tone(benchEdge)}>${fmtSigned(benchEdge, ccy)}</span> <span class="muted small">${benchEdge >= 0 ? 'ahead of' : 'behind'} the same buys in the S&P 500 today</span>`}</p>
+      <${LineChart} label="Portfolio value compared with the same money in the S&P 500" dates=${dates} fmt=${f} axisFmt=${ax}
+        series=${[{ label: 'Your portfolio', values: val, color: 'var(--s1)' }, { label: 'Same buys in S&P 500 (SPY)', values: bench, color: 'var(--s2)' }]}/>
+      <p class="small muted">Each of your buys and sells is mirrored into SPY on the same day with the same dollars. Prices only — dividends left out on both sides.</p>
+    </div>
+
+    ${ccy === 'ILS' && html`<div class="card chart-card">
+      <h3>Where your shekel profit came from</h3>
+      <p class="kpi"><span class=${'num ' + tone(data.stockIls.at(-1))}>${fmtSigned(data.stockIls.at(-1), 'ILS')}</span> <span class="muted small">stocks</span>
+        <span class=${'num ' + tone(data.fxIls.at(-1))}>${fmtSigned(data.fxIls.at(-1), 'ILS')}</span> <span class="muted small">USD/ILS rate</span></p>
+      <${LineChart} label="Shekel profit split into stock moves and currency moves" dates=${dates} fmt=${(v) => fmtSigned(v, 'ILS')} axisFmt=${(v) => fmtCompact(v, 'ILS')} zero=${true}
+        series=${[{ label: 'Stock moves', values: sl(data.stockIls), color: 'var(--s1)' }, { label: 'USD/ILS rate', values: sl(data.fxIls), color: 'var(--s2)' }]}/>
+      <p class="small muted">Shares you still hold. “USD/ILS rate” is what the dollar’s move since each buy added or took away.</p>
+    </div>`}
+  </section>`;
+}
+
+// Price chart for one stock with your buys and sells marked.
+function PriceChart({ ticker, closes, live, txns, range, setRange }) {
+  if (!closes) return null;
+  const buys = txns.filter((t) => t.ticker === ticker && (txType(t) === 'buy' || txType(t) === 'sell'));
+  if (!buys.length) return null;
+  const first = buys.map((t) => t.date).sort()[0];
+  const from = new Date(Date.parse(first) - 30 * 864e5).toISOString().slice(0, 10);
+  let dates = Object.keys(closes).filter((d) => d >= from).sort();
+  const today = todayISO();
+  let prices = dates.map((d) => closes[d]);
+  if (live > 0 && dates.at(-1) < today) { dates.push(today); prices.push(live); }
+  else if (live > 0) prices[prices.length - 1] = live;
+  // average cost of shares held, day by day
+  const ev = [...buys].sort((a, b) => a.date.localeCompare(b.date));
+  const lots = []; let k = 0;
+  const avg = dates.map((d) => {
+    while (k < ev.length && ev[k].date <= d) {
+      const t = ev[k++];
+      if (txType(t) === 'buy') lots.push({ rem: t.shares, per: (t.shares * t.priceUsd + (t.feesUsd || 0)) / t.shares });
+      else { let q = t.shares; while (q > 1e-9 && lots.length) { const n = Math.min(q, lots[0].rem); lots[0].rem -= n; q -= n; if (lots[0].rem <= 1e-9) lots.shift(); } }
+    }
+    const sh = lots.reduce((a, l) => a + l.rem, 0);
+    return sh > 1e-9 ? lots.reduce((a, l) => a + l.rem * l.per, 0) / sh : null;
+  });
+  const i0 = rangeStart(dates, range, today);
+  dates = dates.slice(i0); prices = prices.slice(i0);
+  const markers = ev.map((t) => ({ i: dates.findIndex((d) => d >= t.date), kind: txType(t), title: `${TYPE_LABEL[txType(t)]} ${fmtShares(t.shares)} @ ${price(t.priceUsd)}` })).filter((m) => m.i >= 0);
+  return html`<div class="card chart-card">
+    <div class="chips" role="group" aria-label="Time range">
+      ${RANGES.map(([r, t]) => html`<button class=${'chip small ' + (range === r ? 'on' : '')} aria-pressed=${range === r} onClick=${() => setRange(r)}>${t}</button>`)}
+    </div>
+    <${LineChart} label=${`${ticker} price with your buys`} dates=${dates} fmt=${price} axisFmt=${(v) => '$' + (v >= 100 ? v.toFixed(0) : v.toFixed(2))} markers=${markers}
+      series=${[{ label: 'Price', values: prices, color: 'var(--s1)' }, { label: 'Your average cost', values: avg.slice(i0), color: 'var(--ref)', dash: true }]}/>
+    <p class="small muted"><span class="mk-key buy"></span> buys${ev.some((t) => txType(t) === 'sell') ? html` · <span class="mk-key sell"></span> sells` : ''}</p>
+  </div>`;
 }
 
 // One form for buys, sells, dividends and currency conversions.
@@ -616,6 +732,22 @@ function validTx(t) {
   }
 }
 
+// ---------- price history (Twelve Data free plan: 8 requests per minute) ----------
+const tdCalls = [];
+async function paced(fn, onWait) {
+  for (;;) {
+    const now = Date.now();
+    while (tdCalls.length && now - tdCalls[0] > 61e3) tdCalls.shift();
+    if (tdCalls.length < 8) break;
+    onWait?.(true);
+    await new Promise((r) => setTimeout(r, 61e3 - (now - tdCalls[0]) + 200));
+  }
+  onWait?.(false);
+  tdCalls.push(Date.now());
+  return fn();
+}
+const minus = (iso, d) => new Date(Date.parse(iso) - d * 864e5).toISOString().slice(0, 10);
+
 // ---------- fingerprint lock (WebAuthn platform authenticator; a privacy screen, not encryption) ----------
 const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
@@ -653,6 +785,10 @@ function App() {
   const [state, setState] = useState(null);
   const [toastMsg, setToastMsg] = useState(null);
   const [sort, setSort] = useState('value');
+  const [range, setRange] = useState('ALL');
+  const [pRange, setPRange] = useState('1Y');
+  const [hist, setHist] = useState({ status: 'idle', closes: {}, fx: {} });
+  const histRef = useRef(false);
   const lastRefresh = useRef(0);
   const stRef = useRef();
   stRef.current = state;
@@ -730,6 +866,51 @@ function App() {
     return () => { window.removeEventListener('touchstart', start); window.removeEventListener('touchmove', move); window.removeEventListener('touchend', end); };
   }, []);
 
+  // Download (or top up) daily closes for every stock ever held + SPY, and daily USD/ILS. Cached on the phone.
+  async function ensureHistory(force = false) {
+    const s = stRef.current;
+    if (!s || histRef.current || !s.settings.twelveKey) return;
+    const stockTx = s.lots.filter((t) => txType(t) === 'buy' || txType(t) === 'sell');
+    if (!stockTx.length) return;
+    histRef.current = true;
+    const today = todayISO();
+    const firstOf = {};
+    for (const t of stockTx) if (!firstOf[t.ticker] || t.date < firstOf[t.ticker]) firstOf[t.ticker] = t.date;
+    const first = Object.values(firstOf).sort()[0];
+    firstOf.SPY = first;
+    const cached = (await db.kvGet('hist')) || { closes: {}, meta: {} };
+    const closes = { ...cached.closes }, meta = { ...cached.meta };
+    const todo = Object.keys(firstOf).filter((tk) => force || !meta[tk] || meta[tk].day !== today || meta[tk].from > minus(firstOf[tk], 35));
+    const errors = [];
+    setHist((h) => ({ ...h, status: 'loading', done: 0, total: todo.length, closes, fx: h.fx }));
+    let done = 0;
+    for (const tk of todo) {
+      const want = minus(firstOf[tk], 35);
+      const have = meta[tk] && meta[tk].from <= want ? meta[tk].to : null;
+      try {
+        const got = await paced(() => api.dailyCloses(tk, s.settings.twelveKey, have ? minus(have, 3) : want), (w) => setHist((h) => ({ ...h, waiting: w })));
+        closes[tk] = { ...(have ? closes[tk] : {}), ...got };
+        const ds = Object.keys(closes[tk]).sort();
+        meta[tk] = { from: have ? meta[tk].from : want, to: ds.at(-1) || want, day: today };
+      } catch (e) { errors.push(`${tk}: ${e.message}`); }
+      done++;
+      setHist((h) => ({ ...h, done, closes: { ...closes } }));
+      await db.kvSet('hist', { closes, meta });
+    }
+    let fx = cached.fx || {};
+    try { fx = await api.officialSeries(minus(first, 10)); await db.kvSet('hist', { closes, meta, fx }); } catch (e) { if (!Object.keys(fx).length) errors.push('USD/ILS: ' + e.message); }
+    setHist({ status: 'ready', closes, fx, errors, updated: today });
+    histRef.current = false;
+  }
+  // Show cached history immediately, then top up when the Charts tab or a stock page is opened
+  useEffect(() => { db.kvGet('hist').then((c) => { if (c) setHist((h) => (h.status === 'idle' ? { status: 'cached', closes: c.closes || {}, fx: c.fx || {} } : h)); }).catch(() => {}); }, []);
+  useEffect(() => { if (state && !state.locked && (route.tab === 'charts' || route.ticker)) ensureHistory(); }, [route.tab, route.ticker, !!state, state?.locked, state?.settings.twelveKey]);
+  const histData = useMemo(() => {
+    if (!state || !Object.keys(hist.closes || {}).length || !hist.closes.SPY) return null;
+    const live = Object.fromEntries(Object.entries(state.quotes).filter(([, q]) => q?.price > 0 && q.fetchedAt && Date.now() - q.fetchedAt < 864e5).map(([k, q]) => [k, q.price]));
+    return buildHistory({ txns: state.lots, closes: hist.closes, fx: hist.fx || {}, bench: hist.closes.SPY, today: todayISO(), live, liveFx: state.fx?.rate });
+  }, [state?.lots, state?.quotes, state?.fx, hist]);
+
   // New version published? (version.json is never cached)
   const [newVersion, setNewVersion] = useState(null);
   useEffect(() => {
@@ -771,7 +952,7 @@ function App() {
     patch({ loading: true });
     try {
       await Promise.all((await caches.keys()).map((k) => caches.delete(k)));
-      const files = ['./', './index.html', './styles.css', './app.js', './calc.js', './db.js', './api.js', './ibkr.js', './xlsx.js', './preact-htm.mjs', './manifest.webmanifest', './sw.js'];
+      const files = ['./', './index.html', './styles.css', './app.js', './calc.js', './db.js', './api.js', './ibkr.js', './xlsx.js', './history.js', './charts.js', './preact-htm.mjs', './manifest.webmanifest', './sw.js'];
       await Promise.all(files.map((u) => fetch(u, { cache: 'reload' }).catch(() => {})));
       await (await navigator.serviceWorker?.getRegistration())?.update();
     } catch {}
@@ -917,6 +1098,11 @@ function App() {
       const parsed = parseIbkr(text);
       if (!parsed.txns.length) throw new Error('No stock trades, conversions or dividends found in this file' + (parsed.skipped.length ? ` (${parsed.skipped.length} rows skipped)` : ''));
       const plan = planImport(stRef.current.lots, parsed.txns, parsed.period);
+      if (!plan.add.length && parsed.positions) { // nothing to import, but still check positions against this statement
+        const check = checkPositions(stRef.current.lots, parsed.positions);
+        const meta = { ...stRef.current.meta, lastCheck: check };
+        await db.kvSet('meta', meta); patch({ meta });
+      }
       patch({ pending: { plan, period: parsed.period, positions: parsed.positions, skipped: parsed.skipped, format: parsed.format, fileName } });
       go('#import');
     } catch (e) { toast('IBKR import: ' + e.message, 'error', 9000); }
@@ -974,13 +1160,14 @@ function App() {
   const formType = route.form ? (route.form.isNew ? route.form.type : txType(state.lots.find((t) => t.id === route.form.id) || {})) : null;
   const title = route.form ? (route.form.isNew ? 'New transaction' : 'Edit ' + TYPE_LABEL[formType]?.toLowerCase())
     : route.page === 'import' ? 'Import from IBKR' : route.page === 'conversions' ? 'Conversions'
-    : route.ticker ? route.ticker : { home: 'Portfolio', holdings: 'Holdings', settings: 'Settings' }[route.tab];
+    : route.ticker ? route.ticker : { home: 'Portfolio', holdings: 'Holdings', charts: 'Charts', settings: 'Settings' }[route.tab];
   const sub = route.form || route.ticker || route.page;
   let body;
   if (route.form) body = html`<${TxForm} key=${location.hash} route=${route} txns=${state.lots} pf=${pf} settings=${state.settings} onSave=${saveTx} onDelete=${deleteTx}/>`;
   else if (route.page === 'import') body = html`<${ImportPreview} pending=${state.pending} resultOf=${resultOf} onConfirm=${confirmIbkr} onCancel=${() => { patch({ pending: null }); back('settings'); }}/>`;
   else if (route.page === 'conversions') body = html`<${Conversions} txns=${state.lots}/>`;
-  else if (route.ticker) body = html`<${Detail} ticker=${route.ticker} pf=${pf} ccy=${ccy} quotes=${state.quotes}/>`;
+  else if (route.ticker) body = html`<${Detail} ticker=${route.ticker} pf=${pf} ccy=${ccy} quotes=${state.quotes} closes=${hist.closes?.[route.ticker]} txns=${state.lots} range=${pRange} setRange=${setPRange}/>`;
+  else if (route.tab === 'charts') body = html`<${Charts} data=${histData} ccy=${ccy} hist=${hist} noKey=${!state.settings.twelveKey} onRetry=${() => ensureHistory(true)} range=${range} setRange=${setRange}/>`;
   else if (route.tab === 'holdings') body = html`<${Holdings} pf=${pf} ccy=${ccy} sort=${sort} setSort=${setSort} check=${state.meta.lastCheck}/>`;
   else if (route.tab === 'settings') body = html`<${Settings} state=${view} saveSettings=${saveSettings} onExport=${exportBackup} onImport=${importAny} onIbkr=${importAny} onRefresh=${refresh} onDeleteAll=${deleteAll} onRecalc=${recalcRates} onUndo=${undoImport} onLock=${setLock} toast=${toast}/>`;
   else body = html`<${Home} pf=${pf} ccy=${ccy} setCcy=${(v) => saveSettings({ ccy: v })} state=${view} onExport=${exportBackup} onImport=${importAny} onIbkr=${importAny} onUndo=${undoImport}/>`;
@@ -997,9 +1184,9 @@ function App() {
     </header>
     ${newVersion && html`<button class="update" onClick=${applyUpdate}>New version ${newVersion} — tap to update</button>`}
     <main>${body}</main>
-    ${!route.form && !route.page && route.tab !== 'settings' && state.lots.length > 0 && html`<button class="fab" aria-label="Add a transaction" onClick=${() => go('#tx/new/buy/' + (route.ticker || ''))}><${Icon} d=${I.plus} size=${26}/></button>`}
+    ${!route.form && !route.page && route.tab !== 'settings' && route.tab !== 'charts' && state.lots.length > 0 && html`<button class="fab" aria-label="Add a transaction" onClick=${() => go('#tx/new/buy/' + (route.ticker || ''))}><${Icon} d=${I.plus} size=${26}/></button>`}
     <nav class="tabs">
-      ${[['home', 'Home', I.home], ['holdings', 'Holdings', I.list], ['settings', 'Settings', I.gear]].map(([k, t, d]) => html`
+      ${[['home', 'Home', I.home], ['holdings', 'Holdings', I.list], ['charts', 'Charts', I.chart], ['settings', 'Settings', I.gear]].map(([k, t, d]) => html`
         <button class=${route.tab === k && !sub ? 'on' : route.tab === k ? 'half' : ''} aria-current=${route.tab === k ? 'page' : null} onClick=${() => goTab(k)}><${Icon} d=${d}/><span>${t}</span></button>`)}
     </nav>
     <${Toast} toast=${toastMsg} onClose=${() => setToastMsg(null)}/>`;

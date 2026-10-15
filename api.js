@@ -145,3 +145,17 @@ export async function officialRate(date = 'latest') {
   if (!best) throw new Error('No USD/ILS rate for ' + d);
   return { rate: series[best], date: best, source: rateInfo.source };
 }
+
+// Twelve Data daily closes from `from` (YYYY-MM-DD) to today: {date: close}. 1 API credit per call.
+export async function dailyCloses(symbol, key, from) {
+  const j = await getJSON(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&start_date=${from}&outputsize=5000&apikey=${encodeURIComponent(key)}`, 20000);
+  if (j.status === 'error') {
+    if (j.code === 429) throw new Error('Twelve Data limit reached — try again in a minute');
+    if (j.code === 401) throw new Error('Twelve Data key rejected');
+    if (j.code === 400 && /no data/i.test(j.message || '')) return {};
+    throw new Error(j.message || 'Twelve Data error');
+  }
+  const out = {};
+  for (const v of j.values || []) { const d = String(v.datetime).slice(0, 10); const c = Number(v.close); if (c > 0) out[d] = c; }
+  return out;
+}
