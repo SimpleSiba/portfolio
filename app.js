@@ -4,10 +4,10 @@ import * as api from './api.js';
 import { portfolio, isStale, todayISO, txType, fifoBuyRates } from './calc.js';
 import { parseIbkr, planImport, checkPositions } from './ibkr.js';
 import { xlsxRows, rowsToCsv } from './xlsx.js';
-import { buildHistory, changeOver, rangeStart } from './history.js';
+import { buildHistory, changeOver, rangeStart, rebase } from './history.js';
 import { LineChart } from './charts.js';
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 const DEFAULT_SETTINGS = { finnhubKey: '', twelveKey: '', ccy: 'ILS', hide: false, rateMode: 'official', lockId: null };
 const MIN_REFRESH_MS = 60e3;
 
@@ -336,18 +336,22 @@ function HistoryStatus({ hist, onRetry, noKey }) {
 }
 
 function Charts({ data, ccy, hist, onRetry, noKey, range, setRange }) {
+  const [mode, setMode] = useState('profit');
   if (noKey || !data) return html`<section><${HistoryStatus} hist=${hist} onRetry=${onRetry} noKey=${noKey}/>
     ${!noKey && hist?.status !== 'loading' && html`<div class="card placeholder muted small">No history yet.</div>`}</section>`;
   const C = ccy === 'ILS' ? 'Ils' : 'Usd';
   const i0 = rangeStart(data.dates, range, todayISO());
   const sl = (a) => a.slice(i0);
   const dates = sl(data.dates);
-  const val = sl(data['value' + C]), inv = sl(data['invested' + C]), bench = sl(data['bench' + C]);
+  const val = sl(data['value' + C]), inv = sl(data['invested' + C]), prof = sl(data['profit' + C]);
+  const you = rebase(data['twr' + C], i0), spy = rebase(data['benchIdx' + C], i0);
   const last = val.length - 1;
   const f = (v) => fmtMoney(v, ccy);
   const ax = (v) => fmtCompact(v, ccy);
-  const profitNow = val[last] - inv[last], profitStart = val[0] - inv[0];
-  const benchEdge = val[last] != null && bench[last] != null ? val[last] - bench[last] : null;
+  const sym = ccy === 'ILS' ? '₪' : '$';
+  const pNow = prof[last], pChg = prof[last] - prof[0];
+  const g = (a) => (a[last] == null ? null : a[last] / 100 - 1);
+  const yourG = g(you), spyG = g(spy);
   return html`<section>
     <div class="chips" role="group" aria-label="Time range">
       ${RANGES.map(([k, t]) => html`<button class=${'chip ' + (range === k ? 'on' : '')} aria-pressed=${range === k} onClick=${() => setRange(k)}>${t}</button>`)}
@@ -356,20 +360,30 @@ function Charts({ data, ccy, hist, onRetry, noKey, range, setRange }) {
     ${data.missing.length > 0 && html`<div class="banner warn">No price history for ${data.missing.join(', ')} — left out of the charts.</div>`}
 
     <div class="card chart-card">
-      <h3>Value vs money invested</h3>
-      <p class="kpi"><b class="num">${f(val[last])}</b> <span class=${'num ' + tone(profitNow)}>${fmtSigned(profitNow, ccy)}</span> <span class="muted small">profit now</span></p>
-      ${range !== 'ALL' && html`<p class="small muted">Profit changed <span class=${tone(profitNow - profitStart)}>${fmtSigned(profitNow - profitStart, ccy)}</span> in this period (new money doesn’t count as gain).</p>`}
-      <${LineChart} label="Portfolio value and money invested over time" dates=${dates} fmt=${f} axisFmt=${ax}
-        series=${[{ label: 'Value', values: val, color: 'var(--s1)' }, { label: 'Money invested', values: inv, color: 'var(--ref)', dash: true }]}/>
-      <p class="small muted">Money invested = what you paid for the shares you still hold. The gap between the lines is your profit.</p>
+      <div class="row-between"><h3>${mode === 'profit' ? 'Profit over time' : 'Value vs money invested'}</h3>
+        <div class="chips tight" role="group" aria-label="Chart view">
+          ${[['profit', 'Profit'], ['value', 'Value']].map(([k, t]) => html`<button class=${'chip small ' + (mode === k ? 'on' : '')} aria-pressed=${mode === k} onClick=${() => setMode(k)}>${t}</button>`)}
+        </div></div>
+      ${mode === 'profit' ? html`
+        <p class="kpi"><b class=${'num ' + tone(pNow)}>${fmtSigned(pNow, ccy)}</b> <span class="muted small">total profit</span></p>
+        ${range !== 'ALL' && html`<p class="small muted">Changed <span class=${tone(pChg)}>${fmtSigned(pChg, ccy)}</span> in this period.</p>`}
+        <${LineChart} label="Total profit over time" dates=${dates} fmt=${(v) => fmtSigned(v, ccy)} axisFmt=${ax} zero=${true}
+          series=${[{ label: 'Profit', values: prof, color: 'var(--s1)' }]}/>
+        <p class="small muted">Includes open positions, sales and dividends. Buying more doesn’t move this line — only gains and losses do.</p>`
+      : html`
+        <p class="kpi"><b class="num">${f(val[last])}</b> <span class="muted small">value now</span></p>
+        <${LineChart} label="Portfolio value and money invested over time" dates=${dates} fmt=${f} axisFmt=${ax}
+          series=${[{ label: 'Value', values: val, color: 'var(--s1)' }, { label: 'Money invested', values: inv, color: 'var(--ref)', dash: true }]}/>
+        <p class="small muted">Money invested = what you paid for the shares you still hold. Jumps are buys and sells.</p>`}
     </div>
 
     <div class="card chart-card">
-      <h3>You vs the S&P 500</h3>
-      <p class="kpi">${benchEdge == null ? '' : html`<span class=${'num ' + tone(benchEdge)}>${fmtSigned(benchEdge, ccy)}</span> <span class="muted small">${benchEdge >= 0 ? 'ahead of' : 'behind'} the same buys in the S&P 500 today</span>`}</p>
-      <${LineChart} label="Portfolio value compared with the same money in the S&P 500" dates=${dates} fmt=${f} axisFmt=${ax}
-        series=${[{ label: 'Your portfolio', values: val, color: 'var(--s1)' }, { label: 'Same buys in S&P 500 (SPY)', values: bench, color: 'var(--s2)' }]}/>
-      <p class="small muted">Each of your buys and sells is mirrored into SPY on the same day with the same dollars. Prices only — dividends left out on both sides.</p>
+      <h3>Growth of ${sym}100: you vs S&P 500</h3>
+      <p class="kpi">${yourG != null && html`<span class=${'num ' + tone(yourG)}>${fmtPct(yourG, 1)}</span> <span class="muted small">you</span>`}
+        ${spyG != null && html` <span class=${'num ' + tone(spyG)}>${fmtPct(spyG, 1)}</span> <span class="muted small">S&P 500</span>`}</p>
+      <${LineChart} label="Growth of 100 for your portfolio and the S&P 500" dates=${dates} fmt=${(v) => sym + v.toFixed(1)} axisFmt=${(v) => sym + v.toFixed(0)}
+        series=${[{ label: 'You', values: you, color: 'var(--s1)' }, { label: 'S&P 500 (SPY)', values: spy, color: 'var(--s2)' }]}/>
+      <p class="small muted">How ${sym}100 would have grown with your picks vs the index, from the start of this period. Deposits and timing removed (time-weighted). Your line includes dividends; SPY is price only.</p>
     </div>
 
     ${ccy === 'ILS' && html`<div class="card chart-card">

@@ -183,3 +183,5 @@ details summary { cursor: pointer; color: var(--muted); }
 .table-view th:first-child, .table-view td:first-child { text-align: left; }
 .chip.small { padding: 4px 10px; font-size: 13px; }
 nav.tabs button span { font-size: 11px; }
+.chart-card .row-between { gap: 8px; }
+.chips.tight { gap: 4px; padding: 0; flex-shrink: 0; }
